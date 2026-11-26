@@ -1,0 +1,52 @@
+name: Package Bookworm Build Bundle
+
+# Populate predownloaded/ with every Debian 12 (bookworm) build tool needed to
+# build panfrost_vk_compile, inside a debian:bookworm container, and upload the
+# result as an artifact.  This produces the airgapped bundle without needing a
+# local container (handy when local storage is tight).
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'predownloaded/**'
+      - '.github/workflows/panfrost-vk-predownloaded.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Fetch bookworm packages
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bookworm
+    steps:
+    - name: Install base tools
+      run: |
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          ca-certificates curl gnupg git python3 python3-pip python3-venv tar
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Fetch bookworm packages (debs + wheels + bindgen)
+      run: |
+        cd predownloaded
+        ./fetch.sh
+
+    - name: Package the bundle
+      run: |
+        # Ship the populated dirs plus the install scripts so the tarball is a
+        # self-contained airgapped bundle.
+        # tar -czf predownloaded-bookworm.tar.gz \
+        #   -C predownloaded debs wheels bin README.md install.sh
+        tar -I 'xz -9 -T4 -v' -cf predownloaded-bookworm.tar.xz -C predownloaded debs wheels bin README.md install.sh
+
+    - name: Upload bundle
+      uses: actions/upload-artifact@v4
+      with:
+        name: predownloaded-bookworm
+        path: predownloaded-bookworm.tar.xz
+        retention-days: 5

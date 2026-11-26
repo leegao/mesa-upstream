@@ -1,0 +1,107 @@
+name: Debian Bookworm Build
+
+# Build panfrost_vk_compile inside a Debian 12 (bookworm) container, matching
+# the airgapped bookworm sandbox.  bookworm ships LLVM 14, but the CLC path
+# (pulled in by enabling a panfrost driver) requires LLVM >= 15, so this adds
+# the official LLVM 15 apt repo.
+
+on:
+  push:
+    paths:
+      - 'src/panfrost/**'
+      - 'src/compiler/**'
+      - '.github/workflows/panfrost-vk-compile-bookworm.yml'
+  pull_request:
+    paths:
+      - 'src/panfrost/**'
+      - 'src/compiler/**'
+      - '.github/workflows/panfrost-vk-compile-bookworm.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build panfrost_vk_compile (debian:bookworm)
+    runs-on: ubuntu-latest
+    container:
+      image: debian:bookworm
+    steps:
+    - name: Install base tools
+      run: |
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          ca-certificates curl gnupg git
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install build dependencies (LLVM 15)
+      run: |
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          build-essential pkg-config bison flex libdrm-dev libelf-dev \
+          python3 python3-pip python3-venv \
+          spirv-tools spirv-headers glslang-tools
+        # bookworm only ships LLVM 14; the CLC path needs LLVM >= 15.
+        curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+          | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
+        echo "deb [signed-by=/usr/share/keyrings/llvm.gpg] http://apt.llvm.org/bookworm/ llvm-toolchain-bookworm-15 main" \
+          > /etc/apt/sources.list.d/llvm-15.list
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          llvm-15-dev libclang-15-dev libclc-15-dev libllvmspirvlib-15-dev
+        # Newer meson/ninja than bookworm's distro packages.
+        pip install --break-system-packages meson ninja mako
+
+    - name: Configure
+      env:
+        LLVM_CONFIG: /usr/bin/llvm-config-15
+      run: |
+        meson setup build . \
+          -Dbuildtype=release \
+          -Dplatforms= \
+          -Dglx=disabled \
+          -Degl=disabled \
+          -Dgallium-drivers= \
+          -Dvulkan-drivers=panfrost \
+          -Dprecomp-compiler=enabled \
+          -Dpanfrost-rust=false \
+          -Dllvm=enabled
+
+    - name: Build panfrost_vk_compile
+      run: |
+        ninja -C build src/panfrost/clc/panfrost_vk_compile
+
+    - name: Smoke test
+      run: |
+        BIN=build/src/panfrost/clc/panfrost_vk_compile
+        test -x "$BIN"
+
+        # With no arguments the tool must print usage and exit non-zero.
+        if "$BIN"; then
+          echo "expected panfrost_vk_compile to fail without arguments" >&2
+          exit 1
+        fi
+
+        cat > comp.comp <<'EOF'
+        #version 450
+        layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+        layout(set = 0, binding = 0) buffer Data { float values[]; };
+        void main() {
+            uint i = gl_GlobalInvocationID.x;
+            values[i] = values[i] * 2.0 + 1.0;
+        }
+        EOF
+        glslangValidator -S comp -V comp.comp -o comp.spv
+        "$BIN" comp.spv comp.bin
+        test -s comp.bin
+
+    - name: Upload artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: panfrost_vk_compile-bookworm
+        path: build/src/panfrost/clc/panfrost_vk_compile
+        retention-days: 5
