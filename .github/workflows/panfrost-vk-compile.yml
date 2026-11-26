@@ -1,0 +1,103 @@
+name: Panfrost Vulkan SPIR-V Compiler
+
+# Build the standalone `panfrost_vk_compile` tool, which compiles Vulkan
+# SPIR-V (Vertex / Fragment / Compute) directly to Valhall/Bifrost ISA using
+# Mesa's libpanfrost_compiler + libnir + spirv_to_nir, with no DRM, X11,
+# Wayland or libvulkan dependency.
+
+on:
+  push:
+    paths:
+      - 'src/panfrost/**'
+      - 'src/compiler/**'
+      - '.github/workflows/panfrost-vk-compile.yml'
+  pull_request:
+    paths:
+      - 'src/panfrost/**'
+      - 'src/compiler/**'
+      - '.github/workflows/panfrost-vk-compile.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build panfrost_vk_compile
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential \
+          llvm-21-dev \
+          libclang-21-dev \
+          libdrm-dev \
+          bison \
+          flex \
+          pkg-config \
+          glslang-tools \
+          spirv-tools
+        python -m pip install --upgrade pip
+        pip install mako meson ninja
+
+    - name: Configure
+      env:
+        LLVM_CONFIG: /usr/bin/llvm-config-21
+      run: |
+        meson setup build-panfrost-vk . \
+          -Dbuildtype=release \
+          -Dplatforms= \
+          -Dglx=disabled \
+          -Degl=disabled \
+          -Dgallium-drivers= \
+          -Dvulkan-drivers=panfrost \
+          -Dprecomp-compiler=enabled \
+          -Dllvm=enabled
+
+    - name: Build panfrost_vk_compile
+      run: |
+        ninja -C build-panfrost-vk src/panfrost/clc/panfrost_vk_compile
+
+    - name: Smoke test
+      run: |
+        BIN=build-panfrost-vk/src/panfrost/clc/panfrost_vk_compile
+        test -x "$BIN"
+
+        # With no arguments the tool must print its usage and exit non-zero.
+        if "$BIN"; then
+          echo "expected panfrost_vk_compile to fail without arguments" >&2
+          exit 1
+        fi
+
+        # Compile a real Vulkan compute shader and check that a non-empty
+        # Valhall binary is produced.
+        cat > comp.comp <<'EOF'
+        #version 450
+        layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+        layout(set = 0, binding = 0) buffer Data { float values[]; };
+        void main() {
+            uint i = gl_GlobalInvocationID.x;
+            values[i] = values[i] * 2.0 + 1.0;
+        }
+        EOF
+        glslangValidator -S comp -V comp.comp -o comp.spv
+        "$BIN" 11 comp.spv comp.bin
+        test -s comp.bin
+
+    - name: Upload artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: panfrost_vk_compile
+        path: build-panfrost-vk/src/panfrost/clc/panfrost_vk_compile
+        retention-days: 5
