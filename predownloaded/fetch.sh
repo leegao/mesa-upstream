@@ -62,12 +62,21 @@ cp -f /var/cache/apt/archives/*.deb "$DEBS"/ 2>/dev/null || true
 # Also pick up anything downloaded into the cwd by the fallback path.
 mv -f ./*.deb "$DEBS"/ 2>/dev/null || true
 
+# --- Build SPIRV-Tools >= 2024.1 (bookworm ships 2023.1) -------------------
+# Mesa 27's CLC path requires SPIRV-Tools >= 2024.1; build it from source and
+# drop the .deb into debs/.  Non-fatal: the build will fail at configure if it
+# is missing, but the rest of the bundle is still produced.
+if [ -x "$ROOT/build-spirv-tools.sh" ]; then
+  "$ROOT/build-spirv-tools.sh" || \
+    echo "WARNING: SPIRV-Tools build failed; the CLC build will need it." >&2
+fi
+
 # --- Fetch Python wheels (bookworm python 3.11 compatible) -----------------
 echo "==> Fetching Python wheels"
 python3 -m pip download --dest "$WHEELS" \
   meson ninja mako packaging PyYAML
 
-# --- Fetch bindgen (prebuilt) ----------------------------------------------
+# --- Fetch bindgen (prebuilt; optional for the non-rust build) -------------
 echo "==> Fetching bindgen $BINDGEN_VERSION (prebuilt)"
 ok=0
 for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl; do
@@ -81,11 +90,12 @@ for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl; do
   fi
 done
 if [ "$ok" -ne 1 ]; then
-  echo "prebuilt bindgen download failed; building with cargo instead" >&2
-  cargo install bindgen-cli --version "$BINDGEN_VERSION" --locked
-  cp -f "$(command -v bindgen)" "$BIN"/
+  # bindgen is only needed for the rust-kraid variant; do not fail the whole
+  # fetch if it is unavailable (the default non-rust build does not need it).
+  echo "WARNING: could not fetch bindgen; skipping (rust-kraid variant only)." >&2
+else
+  chmod +x "$BIN"/bindgen 2>/dev/null || true
 fi
-chmod +x "$BIN"/bindgen
 
 echo
 echo "==> Done. Contents:"

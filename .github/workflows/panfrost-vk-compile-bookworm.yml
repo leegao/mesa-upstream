@@ -55,6 +55,23 @@ jobs:
         # Newer meson/ninja than bookworm's distro packages.
         pip install --break-system-packages meson ninja mako
 
+    - name: Build SPIRV-Tools 2024.1 (bookworm ships 2023.1)
+      run: |
+        apt-get install -y --no-install-recommends cmake ninja-build
+        # The v2024.1 tree ref is not a branch; pin the exact commit and let
+        # SPIRV-Tools' git-sync-deps fetch the matching SPIRV-Headers.
+        git clone --filter=blob:none \
+          https://github.com/KhronosGroup/SPIRV-Tools /tmp/SPIRV-Tools
+        git -C /tmp/SPIRV-Tools checkout 04896c462d9f3f504c99a4698605b6524af813c1
+        ( cd /tmp/SPIRV-Tools && python3 utils/git-sync-deps )
+        cmake -S /tmp/SPIRV-Tools -B /tmp/spirv-build -G Ninja \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DSPIRV_BUILD_FUZZER=OFF -DSPIRV_SKIP_TESTS=ON \
+          -DCMAKE_INSTALL_PREFIX=/usr
+        cmake --build /tmp/spirv-build --parallel "$(nproc)"
+        cmake --install /tmp/spirv-build
+        pkg-config --modversion SPIRV-Tools
+
     - name: Configure
       env:
         LLVM_CONFIG: /usr/bin/llvm-config-15
