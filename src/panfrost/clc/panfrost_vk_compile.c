@@ -278,6 +278,23 @@ struct synth_desc_ctx {
    bool add_bounds_checks;
 };
 
+static const char *
+synth_desc_kind_name(enum synth_desc_kind kind)
+{
+   switch (kind) {
+   case SYNTH_DESC_BUFFER:
+      return "buffer";
+   case SYNTH_DESC_TEX_OR_IMG:
+      return "tex_or_img";
+   case SYNTH_DESC_SAMPLER:
+      return "sampler";
+   case SYNTH_DESC_COMBINED_IMAGE_SAMPLER:
+      return "combined_image_sampler";
+   default:
+      return "none";
+   }
+}
+
 static void
 record_synth_binding(struct synth_desc_ctx *ctx, uint32_t set, uint32_t binding,
                      enum synth_desc_kind kind, uint32_t count)
@@ -382,7 +399,6 @@ collect_synth_desc_instr(nir_builder *b, nir_instr *instr, void *data)
 static void
 assign_synth_desc_indices(nir_shader *nir, struct synth_desc_ctx *ctx)
 {
-   /* Also seed array sizes from NIR uniform/buffer variables when available. */
    nir_foreach_variable_with_modes(var, nir,
                                    nir_var_uniform | nir_var_mem_ubo |
                                       nir_var_mem_ssbo | nir_var_image) {
@@ -949,6 +965,114 @@ lower_load_push_consts(nir_shader *nir, struct standalone_fau_info *fau)
             nir_metadata_control_flow, fau);
 }
 
+/* --- Metadata JSON export (for c_8c7eadb161a76028 / spirv2valhall) ------- */
+
+static const char *
+stage_name(mesa_shader_stage stage)
+{
+   switch (stage) {
+   case MESA_SHADER_VERTEX:
+      return "vertex";
+   case MESA_SHADER_FRAGMENT:
+      return "fragment";
+   default:
+      return "compute";
+   }
+}
+
+static void
+write_info_json(const char *path, mesa_shader_stage stage, const char *entry,
+                bool use_kraid, bool idvs, bool robust, bool merge_wg,
+                uint32_t core_max_id, size_t code_size,
+                const struct pan_shader_info *info,
+                const struct standalone_fau_info *fau,
+                const struct synth_desc_ctx *desc_ctx)
+{
+   FILE *f = fopen(path, "w");
+   if (!f) {
+      fprintf(stderr, "panfrost_vk_compile: cannot open %s for writing\n",
+              path);
+      return;
+   }
+
+   fprintf(f, "{\n");
+   fprintf(f, "  \"arch\": %d,\n", PAN_ARCH);
+   fprintf(f, "  \"stage\": \"%s\",\n", stage_name(stage));
+   fprintf(f, "  \"entry\": \"%s\",\n", entry);
+   fprintf(f, "  \"backend\": \"%s\",\n", use_kraid ? "kraid" : "bifrost");
+   fprintf(f, "  \"idvs\": %s,\n", idvs ? "true" : "false");
+   fprintf(f, "  \"robust\": %s,\n", robust ? "true" : "false");
+   fprintf(f, "  \"merge_workgroups\": %s,\n", merge_wg ? "true" : "false");
+   fprintf(f, "  \"core_max_id\": %u,\n", core_max_id);
+   fprintf(f, "  \"code_size\": %zu,\n", code_size);
+   fprintf(f, "  \"instrs\": %u,\n", info->stats.valhall.instrs);
+   fprintf(f, "  \"work_reg_count\": %u,\n", info->work_reg_count);
+   fprintf(f, "  \"tls_size\": %u,\n", info->tls_size);
+   fprintf(f, "  \"wls_size\": %u,\n", info->wls_size);
+
+   fprintf(f, "  \"fau\": {\n");
+   fprintf(f, "    \"sysval_slots\": %u,\n", fau->sysval_count);
+   fprintf(f, "    \"driver_slots\": %u,\n", fau->total_count);
+   fprintf(f, "    \"reserved_words\": %u,\n", info->fau.reserved);
+   fprintf(f, "    \"total_words\": %u,\n", info->fau.count);
+   fprintf(f, "    \"used_sysval_words\": [");
+   bool first = true;
+   for (unsigned i = 0; i < MAX_SYSVAL_FAUS; i++) {
+      if (BITSET_TEST(fau->used_sysvals, i)) {
+         fprintf(f, "%s%u", first ? "" : ", ", i);
+         first = false;
+      }
+   }
+   fprintf(f, "],\n");
+   fprintf(f, "    \"used_push_const_words\": [");
+   first = true;
+   for (unsigned i = 0; i < MAX_PUSH_CONST_FAUS; i++) {
+      if (BITSET_TEST(fau->used_push_consts, i)) {
+         fprintf(f, "%s%u", first ? "" : ", ", i);
+         first = false;
+      }
+   }
+   fprintf(f, "],\n");
+   fprintf(f, "    \"immediates\": [");
+   first = true;
+   pan_fau_foreach_imm(&info->fau, i) {
+      fprintf(f, "%s{\"word\": %u, \"value\": \"0x%08x\"}",
+              first ? "" : ", ", i, info->fau.words[i].constant);
+      first = false;
+   }
+   fprintf(f, "],\n");
+   fprintf(f, "    \"ubo_relocs\": [");
+   first = true;
+   pan_fau_foreach_reloc(&info->fau, i) {
+      fprintf(f, "%s{\"word\": %u, \"ubo\": %u, \"offset\": %u}",
+              first ? "" : ", ", i, info->fau.words[i].relocation.ubo,
+              info->fau.words[i].relocation.offset);
+      first = false;
+   }
+   fprintf(f, "]\n");
+   fprintf(f, "  },\n");
+
+   fprintf(f, "  \"descriptors\": [\n");
+   first = true;
+   for (uint32_t s = 0; s < MAX_SETS; s++) {
+      for (uint32_t b = 0; b < desc_ctx->sets[s].max_binding; b++) {
+         const struct synth_binding_info *bi = &desc_ctx->sets[s].bindings[b];
+         if (bi->kind == SYNTH_DESC_NONE)
+            continue;
+         fprintf(
+            f,
+            "%s    {\"set\": %u, \"table\": %u, \"binding\": %u, "
+            "\"kind\": \"%s\", \"desc_idx\": %u, \"desc_count\": %u}",
+            first ? "" : ",\n", s, s + 1, b, synth_desc_kind_name(bi->kind),
+            bi->desc_idx, bi->desc_count);
+         first = false;
+      }
+   }
+   fprintf(f, "\n  ]\n");
+   fprintf(f, "}\n");
+   fclose(f);
+}
+
 /* --- SPIR-V front-end helpers ------------------------------------------- */
 
 static unsigned
@@ -1050,16 +1174,51 @@ read_spirv(const char *path, size_t *size_out)
    return words;
 }
 
+static void
+print_usage(const char *prog, FILE *stream)
+{
+   fprintf(
+      stream,
+      "Usage: %s [options] <input.spv> <output.bin>\n"
+      "  (built for Valhall arch v%d)\n\n"
+      "Options:\n"
+      "  --kraid               Force Rust Kraid backend (PAN_USE_KRAID=all)\n"
+      "  --no-kraid            Force C Bifrost/Valhall backend (PAN_USE_KRAID=0)\n"
+      "  --robust              Enable SSBO/descriptor robustness bounds checks\n"
+      "  --no-idvs             Disable IDVS for vertex shaders\n"
+      "  --entry <name>        Override SPIR-V entry point name\n"
+      "  --stage <vert|frag|comp>  Override detected shader stage\n"
+      "  --core-max-id <N>     Set load_core_max_id_arm sysval (default: 0)\n"
+      "  --no-promote-imm      Disable FAU immediate promotion\n"
+      "  --no-clamp-version    Do not clamp SPIR-V >= 1.4 header to 1.3\n"
+      "  --dump-nir            Print final lowered NIR to stderr\n"
+      "  --disasm              Disassemble emitted Valhall ISA to stderr\n"
+      "  --info-json <file>    Write FAU, descriptor, and shader stats JSON\n"
+      "  -h, --help            Show this help message\n",
+      prog, PAN_ARCH);
+}
+
 int
 main(int argc, char **argv)
 {
    const char *in_path = NULL;
    const char *out_path = NULL;
+   const char *entry_override = NULL;
+   const char *info_json_path = NULL;
+   int stage_override = -1;
    bool robust = getenv("PANVK_ROBUST") && atoi(getenv("PANVK_ROBUST")) != 0;
    bool no_idvs = false;
+   bool promote_imm = true;
+   bool clamp_version = true;
+   bool dump_nir = false;
+   bool disasm = false;
+   uint32_t core_max_id = 0;
 
    for (int i = 1; i < argc; i++) {
-      if (strcmp(argv[i], "--robust") == 0) {
+      if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+         print_usage(argv[0], stdout);
+         return 0;
+      } else if (strcmp(argv[i], "--robust") == 0) {
          robust = true;
       } else if (strcmp(argv[i], "--no-idvs") == 0) {
          no_idvs = true;
@@ -1067,6 +1226,35 @@ main(int argc, char **argv)
          setenv("PAN_USE_KRAID", "all", 1);
       } else if (strcmp(argv[i], "--no-kraid") == 0) {
          setenv("PAN_USE_KRAID", "0", 1);
+      } else if (strcmp(argv[i], "--no-promote-imm") == 0) {
+         promote_imm = false;
+      } else if (strcmp(argv[i], "--no-clamp-version") == 0) {
+         clamp_version = false;
+      } else if (strcmp(argv[i], "--dump-nir") == 0) {
+         dump_nir = true;
+      } else if (strcmp(argv[i], "--disasm") == 0) {
+         disasm = true;
+      } else if (strcmp(argv[i], "--entry") == 0 && i + 1 < argc) {
+         entry_override = argv[++i];
+      } else if (strcmp(argv[i], "--info-json") == 0 && i + 1 < argc) {
+         info_json_path = argv[++i];
+      } else if (strcmp(argv[i], "--core-max-id") == 0 && i + 1 < argc) {
+         core_max_id = (uint32_t)strtoul(argv[++i], NULL, 0);
+      } else if (strcmp(argv[i], "--stage") == 0 && i + 1 < argc) {
+         const char *s = argv[++i];
+         if (strcmp(s, "vert") == 0 || strcmp(s, "vertex") == 0) {
+            stage_override = MESA_SHADER_VERTEX;
+         } else if (strcmp(s, "frag") == 0 || strcmp(s, "fragment") == 0) {
+            stage_override = MESA_SHADER_FRAGMENT;
+         } else if (strcmp(s, "comp") == 0 || strcmp(s, "compute") == 0) {
+            stage_override = MESA_SHADER_COMPUTE;
+         } else {
+            fprintf(stderr, "panfrost_vk_compile: unknown stage '%s'\n", s);
+            return 1;
+         }
+      } else if (argv[i][0] == '-') {
+         fprintf(stderr, "panfrost_vk_compile: unknown option '%s'\n", argv[i]);
+         return 1;
       } else if (!in_path) {
          in_path = argv[i];
       } else if (!out_path) {
@@ -1079,12 +1267,13 @@ main(int argc, char **argv)
    }
 
    if (!in_path || !out_path) {
-      fprintf(stderr,
-              "Usage: %s [--kraid|--no-kraid] [--robust] [--no-idvs] "
-              "<input.spv> <output.bin>\n"
-              "  (built for Valhall arch v%d)\n",
-              argv[0], PAN_ARCH);
+      print_usage(argv[0], stderr);
       return 1;
+   }
+
+   if (disasm) {
+      setenv("BIFROST_MESA_DEBUG", "shaders", 1);
+      setenv("PAN_MESA_DEBUG", "shaders", 1);
    }
 
    size_t spirv_size = 0;
@@ -1099,12 +1288,16 @@ main(int argc, char **argv)
       return 1;
    }
 
-   if (words[SPIRV_VERSION_WORD] > SPIRV_VERSION_1_3)
+   if (clamp_version && words[SPIRV_VERSION_WORD] > SPIRV_VERSION_1_3)
       words[SPIRV_VERSION_WORD] = SPIRV_VERSION_1_3;
 
    char entry[64];
    mesa_shader_stage stage =
       detect_stage(words, spirv_size / 4, entry, sizeof(entry));
+   if (entry_override)
+      snprintf(entry, sizeof(entry), "%s", entry_override);
+   if (stage_override >= 0)
+      stage = (mesa_shader_stage)stage_override;
 
    glsl_type_singleton_init_or_ref();
 
@@ -1166,7 +1359,7 @@ main(int argc, char **argv)
       NIR_PASS(_, nir, nir_lower_wpos_center);
 
    NIR_PASS(_, nir, nir_inline_sysval,
-            nir_intrinsic_load_core_max_id_arm, 0);
+            nir_intrinsic_load_core_max_id_arm, core_max_id);
 
    pan_preprocess_nir(nir, PAN_ARCH);
 
@@ -1260,7 +1453,7 @@ main(int argc, char **argv)
       .robust_modes =
          robust ? (nir_var_mem_ubo | nir_var_mem_ssbo) : 0,
       .robust_descriptors = PAN_ARCH >= 10,
-      .fau = { .reserved = 0, .promote_immediates = true },
+      .fau = { .reserved = 0, .promote_immediates = promote_imm },
    };
 
    struct pan_varying_layout vlayout = {0};
@@ -1282,7 +1475,10 @@ main(int argc, char **argv)
    lower_load_push_consts(nir, &fau);
 
    inputs.fau.reserved = fau.total_count * 2;
-   inputs.fau.promote_immediates = true;
+   inputs.fau.promote_immediates = promote_imm;
+
+   if (dump_nir)
+      nir_print_shader(nir, stderr);
 
    struct util_dynarray binary;
    util_dynarray_init(&binary, NULL);
@@ -1301,15 +1497,18 @@ main(int argc, char **argv)
    fwrite(binary.data, 1, binary.size, out);
    fclose(out);
 
+   bool used_kraid = pan_use_kraid(PAN_ARCH, stage, false);
+   if (info_json_path) {
+      write_info_json(info_json_path, stage, entry, used_kraid, !no_idvs,
+                      robust, allow_merging_workgroups, core_max_id,
+                      binary.size, &info, &fau, &desc_ctx);
+   }
+
    uint32_t instrs = info.stats.valhall.instrs;
    fprintf(stderr,
            "panfrost_vk_compile: %s (%s, %s, fau=%u) -> %s: %u bytes, "
            "%u instructions\n",
-           entry,
-           stage == MESA_SHADER_VERTEX   ? "vertex"
-           : stage == MESA_SHADER_FRAGMENT ? "fragment"
-                                           : "compute",
-           pan_use_kraid(PAN_ARCH, stage, false) ? "kraid" : "bifrost",
+           entry, stage_name(stage), used_kraid ? "kraid" : "bifrost",
            fau.total_count, out_path, (unsigned)binary.size, instrs);
 
    util_dynarray_fini(&binary);
