@@ -117,12 +117,12 @@ jobs:
 
         # Default backend (Bifrost for non-rust; Bifrost via the tool's
         # PAN_USE_KRAID=0 default for the rust build).
-        "$BIN" 11 comp.spv comp.bin
+        "$BIN" comp.spv comp.bin
         test -s comp.bin
 
         # Rust/Kraid variant: also exercise the Kraid compute path.
         if [ "${{ matrix.panfrost_rust }}" = "true" ]; then
-          PAN_USE_KRAID=all "$BIN" 11 comp.spv comp-kraid.bin
+          PAN_USE_KRAID=all "$BIN" comp.spv comp-kraid.bin
           test -s comp-kraid.bin
         fi
 
