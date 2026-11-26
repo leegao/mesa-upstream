@@ -26,7 +26,11 @@ endif
 # panfrost_compile (OpenCL-only), this drives spirv_to_nir with
 # NIR_SPIRV_VULKAN and links the full panfrost compiler backend, so it can
 # compile Vertex/Fragment/Compute Vulkan shaders offline with no DRM/Wayland/
-# libvulkan dependency.
+# libvulkan/libpanvk dependency.
+#
+# panvk_nir_lower_cooperative_matrix.c is a pure NIR pass that only depends on
+# nir_builder.h, util/hash_table.h, and panvk_nir.h; compile it directly into
+# the standalone executable without linking libpanvk.
 #
 # The tool is specialized for a single Valhall generation at a time via the
 # PAN_ARCH compile-time define (valid 9..15, default 11).  To build for a
@@ -35,8 +39,16 @@ pan_vk_arch = 11
 
 panfrost_vk_compile = executable(
   'panfrost_vk_compile',
-  ['panfrost_vk_compile.c'],
-  include_directories : [inc_include, inc_src, inc_panfrost],
+  [
+    'panfrost_vk_compile.c',
+    '../vulkan/panvk_nir_lower_cooperative_matrix.c',
+  ],
+  include_directories : [
+    inc_include,
+    inc_src,
+    inc_panfrost,
+    include_directories('../vulkan'),
+  ],
   link_with : [libpanfrost_compiler],
   c_args : [
     c_msvc_compat_args, no_override_init_args, soong_compat_c_args,

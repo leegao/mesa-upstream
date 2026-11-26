@@ -1,9 +1,10 @@
 name: Debian Bookworm Build
 
 # Build panfrost_vk_compile inside a Debian 12 (bookworm) container, matching
-# the airgapped bookworm sandbox.  bookworm ships LLVM 14, but the CLC path
-# (pulled in by enabling a panfrost driver) requires LLVM >= 15, so this adds
-# the official LLVM 15 apt repo.
+# the airgapped bookworm sandbox.  bookworm ships LLVM 14 and rustc 1.63, but
+# the CLC path requires LLVM >= 15 and Mesa's Rust/Kraid backend requires
+# rustc >= 1.85 and bindgen == 0.71.1, so this installs LLVM 15 from
+# apt.llvm.org and Rust + bindgen-cli 0.71.1 via rustup/cargo.
 
 on:
   push:
@@ -23,7 +24,7 @@ permissions:
 
 jobs:
   build:
-    name: Build panfrost_vk_compile (debian:bookworm)
+    name: Build panfrost_vk_compile (debian:bookworm, rust/kraid)
     runs-on: ubuntu-latest
     container:
       image: debian:bookworm
@@ -55,6 +56,19 @@ jobs:
         # Newer meson/ninja than bookworm's distro packages.
         pip install --break-system-packages meson ninja mako
 
+    - name: Install Rust (>= 1.85) and bindgen 0.71.1
+      run: |
+        # bookworm only ships rustc 1.63, while Mesa requires rustc >= 1.85.
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+          | sh -s -- -y --profile minimal --default-toolchain stable
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        export PATH="$HOME/.cargo/bin:$PATH"
+        rustc --version
+        cargo --version
+        # Mesa requires bindgen >= 0.71.1; 0.72.0 and 0.73.x are blacklisted.
+        cargo install bindgen-cli --version 0.71.1 --locked
+        bindgen --version
+
     - name: Build SPIRV-Tools 2024.1 (bookworm ships 2023.1)
       run: |
         apt-get install -y --no-install-recommends cmake ninja-build
@@ -84,7 +98,7 @@ jobs:
           -Dgallium-drivers= \
           -Dvulkan-drivers=panfrost \
           -Dprecomp-compiler=enabled \
-          -Dpanfrost-rust=false \
+          -Dpanfrost-rust=true \
           -Dllvm=enabled
 
     - name: Build panfrost_vk_compile
@@ -112,8 +126,21 @@ jobs:
         }
         EOF
         glslangValidator -S comp -V comp.comp -o comp.spv
-        "$BIN" comp.spv comp.bin
-        test -s comp.bin
+        "$BIN" --kraid comp.spv comp_kraid.bin
+        test -s comp_kraid.bin
+        "$BIN" --no-kraid comp.spv comp_bi.bin
+        test -s comp_bi.bin
+
+        cat > vert.vert <<'EOF'
+        #version 450
+        layout(location = 0) in vec4 a_pos;
+        void main() {
+            gl_Position = a_pos;
+        }
+        EOF
+        glslangValidator -S vert -V vert.vert -o vert.spv
+        "$BIN" --kraid vert.spv vert_kraid.bin
+        test -s vert_kraid.bin
 
     - name: Upload artifact
       if: always()

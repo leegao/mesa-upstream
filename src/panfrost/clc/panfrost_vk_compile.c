@@ -5,22 +5,29 @@
  * Standalone Vulkan SPIR-V -> Valhall/Bifrost ISA compiler.
  *
  * This is a thin, self-contained driver modelled on panvk's shader compile
- * path (src/panfrost/vulkan/panvk_vX_shader.c) and the OpenCL-only
- * pan_compile.c.  It links directly against libpanfrost_compiler + libnir +
- * spirv_to_nir and therefore has no dependency on DRM, X11, Wayland or
- * libvulkan.  It accepts Vulkan SPIR-V for the Vertex, Fragment and Compute
- * stages and emits a raw Valhall/Bifrost binary blob.
+ * path (src/panfrost/vulkan/panvk_vX_shader.c) and pan_compile.c.  It links
+ * directly against libpanfrost_compiler + libnir + spirv_to_nir (plus the
+ * pure-NIR panvk_nir_lower_cooperative_matrix.c) and has no dependency on
+ * DRM, panthor, libvulkan, or libpanvk.
  *
- * The tool is specialized for a single Valhall generation at a time via the
- * PAN_ARCH compile-time define (valid 9..15, default 11), mirroring how panvk
- * compiles panvk_vX_shader.c once per arch.  The pass ordering follows
- * panvk_preprocess_nir -> panvk_lower_nir -> panvk_lower_nir_io ->
- * panvk_compile_nir as closely as possible for v9+.
- *
- * The descriptor handling is intentionally minimal: it does not know about
- * VkDescriptorSetLayout, so descriptors are collapsed into packed immediates
- * instead of the full panvk descriptor-lowering machinery.  Likewise the
- * sysval and push-constant packing is simplified (no panvk_shader_variant).
+ * To match on-device panvk v11 and align with Mali DDK (libMali r55p0
+ * Mali-G715, VEHW=0x1c/0x1d0000):
+ *  - IDVS is enabled by default (no_idvs = false), matching both panvk on v9+
+ *    and libMali's VERTEX POSITION SHADER, and eliminating the lea_attr_pan
+ *    intrinsic so the Rust Kraid backend can compile VS/FS/CS.
+ *  - Cooperative matrix lowering runs with pan_subgroup_size(PAN_ARCH) (16 on
+ *    v9+).
+ *  - Descriptor lowering infers a synthetic VkDescriptorSetLayout directly from
+ *    the NIR shader, using nir_address_format_vec2_index_32bit_offset,
+ *    valhall_lower_get_ssbo_size (table 62), and valhall_pack_buf_idx.
+ *  - Optional --robust enables nir_lower_robust_access + bounds checks (off by
+ *    default, matching libMali's cmpbe_has_robustness == 0).
+ *  - panvk_can_merge_workgroups + panvk_lower_non_uniform handle workgroup
+ *    merging and non-uniform descriptor indexing.
+ *  - panvk_lower_sysvals + lower_load_push_consts pack sysvals (including
+ *    viewport transform and FS 4-word blend constants) and user push constants
+ *    into FAU, setting inputs.fau.reserved = total_count * 2 instead of a
+ *    hardcoded 64.
  */
 
 #include "compiler/glsl_types.h"
@@ -30,12 +37,16 @@
 #include "nir_builder.h"
 #include "nir_builder_opcodes.h"
 #include "nir_intrinsics.h"
+#include "panfrost/compiler/bifrost/bifrost_compile.h"
 #include "panfrost/compiler/pan_compiler.h"
 #include "panfrost/compiler/pan_nir.h"
+#include "panfrost/vulkan/panvk_nir.h"
 #include "shader_enums.h"
+#include "util/bitset.h"
 #include "util/macros.h"
 #include "util/u_dynarray.h"
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -53,6 +64,15 @@
 #define SPIRV_VERSION_WORD 1
 #define SPIRV_VERSION_1_3 0x00010300u
 
+#define PANVK_DESCRIPTOR_SIZE 32u
+#define MAX_SETS 7u
+#define MAX_BINDINGS_PER_SET 128u
+#define MAX_RTS 8u
+#define MAX_PUSH_CONSTANTS_SIZE 256u
+#define FAU_WORD_SIZE sizeof(uint64_t)
+#define FAU_WORD_COUNT 64u
+#define SYSVALS_PUSH_CONST_BASE MAX_PUSH_CONSTANTS_SIZE
+
 /* glsl_type_size: number of attribute slots a type occupies, matching the
  * function panvk passes to nir_lower_io().
  */
@@ -62,120 +82,875 @@ glsl_type_size(const struct glsl_type *type, bool bindless)
    return glsl_count_attribute_slots(type, false);
 }
 
-/* --- Ported verbatim (modulo panvk types) from panvk_vX_shader.c --------- */
-
-/* NOTE: panvk lowers UBO/SSBO with nir_address_format_vec2_index_32bit_offset
- * and then runs valhall_lower_get_ssbo_size() + valhall_pack_buf_idx() to
- * fold the array size into the index and pack it back to a scalar.  That
- * requires the full panvk descriptor lowering to produce a 2-component
- * resource index.  Our simplified descriptor collapse below yields a
- * 1-component index, so we use nir_address_format_32bit_index_offset and skip
- * those two helpers. */
-
-/* --- Simplified descriptor / sysval lowering (no panvk state) ------------ */
-
-/* Collapse Vulkan descriptor intrinsics into packed immediates and drop the
- * texture/sampler derefs that the standalone flow cannot resolve.  The packed
- * descriptor follows the Valhall LD_PKA/LEA_PKA layout:
- *   ((4 + set) << 24) | binding
- */
-static bool
-lower_vk_descriptors_and_tex(nir_builder *b, nir_instr *instr, void *data)
+static void
+shared_type_info(const struct glsl_type *type, unsigned *size, unsigned *align)
 {
+   assert(glsl_type_is_vector_or_scalar(type));
+
+   uint32_t comp_size =
+      glsl_type_is_boolean(type) ? 4 : glsl_get_bit_size(type) / 8;
+   unsigned length = glsl_get_vector_elements(type);
+   *size = comp_size * length;
+   *align = comp_size * (length == 3 ? 4 : length);
+}
+
+/* --- Standalone panvk FAU / sysval layout (from panvk_shader.h) --------- */
+
+typedef uint64_t aligned_u64 __attribute__((aligned(8)));
+
+struct panvk_common_sysvals_inner {
+   aligned_u64 push_uniforms;
+   aligned_u64 printf_buffer_address;
+   aligned_u64 constant_data;
+} __attribute__((aligned(FAU_WORD_SIZE)));
+
+struct panvk_common_sysvals {
+   uint32_t _pad[4];
+   struct panvk_common_sysvals_inner common;
+} __attribute__((aligned(FAU_WORD_SIZE)));
+
+struct panvk_graphics_sysvals {
+   struct {
+      float constants[4];
+   } blend;
+
+   struct panvk_common_sysvals_inner common;
+
+   struct {
+      struct {
+         float x, y, z;
+      } scale, offset;
+   } viewport;
+
+   struct {
+      uint64_t vertex_params;
+      uint64_t geometry_params;
+      uint64_t pipeline_stats;
+      uint32_t pipeline_stats_flags;
+      uint32_t rasterization_stream;
+      uint32_t is_api_gs;
+      uint32_t provoking_vertex;
+   } poly;
+
+   struct {
+      int32_t first_vertex;
+      int32_t base_instance;
+      uint32_t noperspective_varyings;
+   } vs;
+
+   struct {
+      aligned_u64 blend_descs[MAX_RTS];
+   } fs;
+
+   struct {
+      uint32_t target;
+      uint32_t conv;
+   } iam[MAX_RTS + 1];
+} __attribute__((aligned(FAU_WORD_SIZE)));
+
+struct panvk_compute_sysvals {
+   struct {
+      uint32_t x, y, z;
+   } base;
+
+   uint32_t _pad;
+
+   struct panvk_common_sysvals_inner common;
+
+   struct {
+      uint32_t x, y, z;
+   } num_work_groups;
+   struct {
+      uint32_t x, y, z;
+   } local_group_size;
+} __attribute__((aligned(FAU_WORD_SIZE)));
+
+#define common_sysval_size(__name) \
+   sizeof(((struct panvk_common_sysvals *)NULL)->common.__name)
+#define graphics_sysval_size(__name) \
+   sizeof(((struct panvk_graphics_sysvals *)NULL)->__name)
+#define compute_sysval_size(__name) \
+   sizeof(((struct panvk_compute_sysvals *)NULL)->__name)
+#define sysval_size(__ptype, __name) __ptype##_sysval_size(__name)
+
+#define common_sysval_offset(__name) \
+   offsetof(struct panvk_common_sysvals, common.__name)
+#define graphics_sysval_offset(__name) \
+   offsetof(struct panvk_graphics_sysvals, __name)
+#define compute_sysval_offset(__name) \
+   offsetof(struct panvk_compute_sysvals, __name)
+#define sysval_offset(__ptype, __name) __ptype##_sysval_offset(__name)
+
+#define sysval_entry_size(__ptype, __name) \
+   sizeof(((struct panvk_##__ptype##_sysvals *)NULL)->__name[0])
+#define sysval_entry_offset(__ptype, __name, __idx) \
+   (sysval_offset(__ptype, __name) +                \
+    (sysval_entry_size(__ptype, __name) * (__idx)))
+
+#define sysval_fau_start(__ptype, __name) \
+   (sysval_offset(__ptype, __name) / FAU_WORD_SIZE)
+#define sysval_fau_end(__ptype, __name) \
+   ((sysval_offset(__ptype, __name) + sysval_size(__ptype, __name) - 1) / \
+    FAU_WORD_SIZE)
+
+#define MAX_COMPUTE_SYSVAL_FAUS \
+   (sizeof(struct panvk_compute_sysvals) / FAU_WORD_SIZE)
+#define MAX_GFX_SYSVAL_FAUS \
+   (sizeof(struct panvk_graphics_sysvals) / FAU_WORD_SIZE)
+#define MAX_SYSVAL_FAUS MAX2(MAX_COMPUTE_SYSVAL_FAUS, MAX_GFX_SYSVAL_FAUS)
+#define MAX_PUSH_CONST_FAUS (MAX_PUSH_CONSTANTS_SIZE / FAU_WORD_SIZE)
+
+struct standalone_fau_info {
+   BITSET_DECLARE(used_sysvals, MAX_SYSVAL_FAUS);
+   BITSET_DECLARE(used_push_consts, MAX_PUSH_CONST_FAUS);
+   uint32_t sysval_count;
+   uint32_t total_count;
+};
+
+#define shader_use_sysval(__fau, __ptype, __name) \
+   BITSET_SET_RANGE((__fau)->used_sysvals,        \
+                    sysval_fau_start(__ptype, __name), \
+                    sysval_fau_end(__ptype, __name))
+
+static void
+fau_use_range(BITSET_WORD *bitset, unsigned max_words, uint32_t offset,
+              uint32_t size)
+{
+   if (size == 0)
+      return;
+   uint32_t start = offset / FAU_WORD_SIZE;
+   uint32_t end = (offset + size - 1) / FAU_WORD_SIZE;
+   assert(end < max_words);
+   BITSET_SET_RANGE(bitset, start, end);
+}
+
+#define shader_remapped_fau_offset(__fau, __kind, __offset)                  \
+   ((FAU_WORD_SIZE *                                                         \
+     BITSET_PREFIX_SUM((__fau)->used_##__kind, (__offset) / FAU_WORD_SIZE)) + \
+    ((__offset) % FAU_WORD_SIZE))
+
+#define shader_remapped_sysval_offset(__fau, __offset) \
+   shader_remapped_fau_offset(__fau, sysvals, __offset)
+
+#define shader_remapped_push_const_offset(__fau, __offset) \
+   (((__fau)->sysval_count * FAU_WORD_SIZE) +              \
+    shader_remapped_fau_offset(__fau, push_consts, __offset))
+
+#define load_sysval(b, __ptype, __bit_size, __name)                    \
+   nir_load_push_constant(                                             \
+      b, sysval_size(__ptype, __name) / ((__bit_size) / 8),            \
+      __bit_size, nir_imm_int(b, 0),                                   \
+      .base = SYSVALS_PUSH_CONST_BASE + sysval_offset(__ptype, __name), \
+      .range = sysval_size(__ptype, __name))
+
+#define load_sysval_entry(b, __ptype, __bit_size, __name, __idx)             \
+   nir_load_push_constant(                                                   \
+      b, sysval_entry_size(__ptype, __name) / ((__bit_size) / 8),            \
+      __bit_size,                                                            \
+      nir_imul_imm(b, __idx, sysval_entry_size(__ptype, __name)),            \
+      .base = SYSVALS_PUSH_CONST_BASE + sysval_offset(__ptype, __name),      \
+      .range = sysval_size(__ptype, __name))
+
+/* --- Synthetic descriptor-set layout & v9+ descriptor lowering ---------- */
+
+enum synth_desc_kind {
+   SYNTH_DESC_NONE = 0,
+   SYNTH_DESC_BUFFER,
+   SYNTH_DESC_TEX_OR_IMG,
+   SYNTH_DESC_SAMPLER,
+   SYNTH_DESC_COMBINED_IMAGE_SAMPLER,
+};
+
+struct synth_binding_info {
+   enum synth_desc_kind kind;
+   uint32_t desc_count;
+   uint32_t desc_idx;
+};
+
+struct synth_set_layout {
+   struct synth_binding_info bindings[MAX_BINDINGS_PER_SET];
+   uint32_t max_binding;
+   uint32_t total_descs;
+};
+
+struct synth_desc_ctx {
+   struct synth_set_layout sets[MAX_SETS];
+   bool add_bounds_checks;
+};
+
+static void
+record_synth_binding(struct synth_desc_ctx *ctx, uint32_t set, uint32_t binding,
+                     enum synth_desc_kind kind, uint32_t count)
+{
+   if (set >= MAX_SETS || binding >= MAX_BINDINGS_PER_SET)
+      return;
+
+   struct synth_binding_info *b = &ctx->sets[set].bindings[binding];
+   if (b->kind == SYNTH_DESC_NONE) {
+      b->kind = kind;
+   } else if ((b->kind == SYNTH_DESC_TEX_OR_IMG &&
+               kind == SYNTH_DESC_SAMPLER) ||
+              (b->kind == SYNTH_DESC_SAMPLER &&
+               kind == SYNTH_DESC_TEX_OR_IMG)) {
+      b->kind = SYNTH_DESC_COMBINED_IMAGE_SAMPLER;
+   }
+
+   if (count > b->desc_count)
+      b->desc_count = count;
+   if (binding + 1 > ctx->sets[set].max_binding)
+      ctx->sets[set].max_binding = binding + 1;
+}
+
+static void
+get_deref_binding_info(nir_deref_instr *deref, uint32_t *set_out,
+                       uint32_t *binding_out, nir_def **index_ssa_out,
+                       uint32_t *max_idx_out)
+{
+   nir_deref_instr *parent = nir_deref_instr_parent(deref);
+   if (deref->deref_type == nir_deref_type_array && parent) {
+      *index_ssa_out = deref->arr.index.ssa;
+      uint32_t arr_sz = (uint32_t)glsl_array_size(parent->type);
+      *max_idx_out = arr_sz > 0 ? arr_sz - 1 : UINT32_MAX;
+      deref = parent;
+   } else {
+      *index_ssa_out = NULL;
+      *max_idx_out = 0;
+   }
+
+   nir_variable *var = nir_deref_instr_get_variable(deref);
+   assert(var != NULL);
+   *set_out = var->data.descriptor_set;
+   *binding_out = var->data.binding;
+}
+
+static bool
+collect_synth_desc_instr(nir_builder *b, nir_instr *instr, void *data)
+{
+   struct synth_desc_ctx *ctx = data;
+
    if (instr->type == nir_instr_type_intrinsic) {
       nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-
-      if (intr->intrinsic == nir_intrinsic_vulkan_resource_index) {
+      switch (intr->intrinsic) {
+      case nir_intrinsic_vulkan_resource_index: {
          uint32_t set = nir_intrinsic_desc_set(intr);
          uint32_t binding = nir_intrinsic_binding(intr);
-         uint32_t packed = ((4u + set) << 24) | (binding & 0xFFFFu);
-
-         b->cursor = nir_before_instr(instr);
-         nir_def *c;
-         if (intr->def.num_components == 1)
-            c = nir_imm_int(b, packed);
-         else
-            c = nir_imm_ivec2(b, packed, 0);
-
-         nir_def_rewrite_uses(&intr->def, c);
-         nir_instr_remove(instr);
-         return true;
+         record_synth_binding(ctx, set, binding, SYNTH_DESC_BUFFER, 1);
+         break;
       }
-
-      if (intr->intrinsic == nir_intrinsic_load_vulkan_descriptor) {
-         nir_def_rewrite_uses(&intr->def, intr->src[0].ssa);
-         nir_instr_remove(instr);
-         return true;
+      case nir_intrinsic_image_deref_store:
+      case nir_intrinsic_image_deref_load:
+      case nir_intrinsic_image_deref_atomic:
+      case nir_intrinsic_image_deref_atomic_swap:
+      case nir_intrinsic_image_deref_size:
+      case nir_intrinsic_image_deref_samples: {
+         nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+         uint32_t set, binding, max_idx;
+         nir_def *idx_ssa;
+         get_deref_binding_info(deref, &set, &binding, &idx_ssa, &max_idx);
+         uint32_t cnt = max_idx == UINT32_MAX ? UINT32_MAX : max_idx + 1;
+         record_synth_binding(ctx, set, binding, SYNTH_DESC_TEX_OR_IMG, cnt);
+         break;
       }
-
-      if (intr->intrinsic == nir_intrinsic_load_push_constant) {
-         /* bi_emit_load_push_constant asserts base == 0 && range == 0; panvk
-          * zeroes these after packing, so mirror that here. */
-         nir_intrinsic_set_base(intr, 0);
-         nir_intrinsic_set_range(intr, 0);
-         return true;
+      default:
+         break;
       }
    } else if (instr->type == nir_instr_type_tex) {
       nir_tex_instr *tex = nir_instr_as_tex(instr);
-      for (int i = (int)tex->num_srcs - 1; i >= 0; --i) {
-         if (tex->src[i].src_type == nir_tex_src_texture_deref ||
-             tex->src[i].src_type == nir_tex_src_sampler_deref) {
-            nir_tex_instr_remove_src(tex, i);
-         }
+      int tex_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+      if (tex_idx >= 0) {
+         nir_deref_instr *deref = nir_src_as_deref(tex->src[tex_idx].src);
+         uint32_t set, binding, max_idx;
+         nir_def *idx_ssa;
+         get_deref_binding_info(deref, &set, &binding, &idx_ssa, &max_idx);
+         uint32_t cnt = max_idx == UINT32_MAX ? UINT32_MAX : max_idx + 1;
+         record_synth_binding(ctx, set, binding, SYNTH_DESC_TEX_OR_IMG, cnt);
       }
-      return true;
+      int smp_idx = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+      if (smp_idx >= 0) {
+         nir_deref_instr *deref = nir_src_as_deref(tex->src[smp_idx].src);
+         uint32_t set, binding, max_idx;
+         nir_def *idx_ssa;
+         get_deref_binding_info(deref, &set, &binding, &idx_ssa, &max_idx);
+         uint32_t cnt = max_idx == UINT32_MAX ? UINT32_MAX : max_idx + 1;
+         record_synth_binding(ctx, set, binding, SYNTH_DESC_SAMPLER, cnt);
+      }
    }
 
    return false;
 }
 
-/* pan_postprocess_nir() injects viewport-transform sysvals for gl_Position, and
- * nir_lower_compute_system_values() (with has_base_workgroup_id) leaves a
- * load_base_workgroup_id behind.  Lower them to neutral values so the backend
- * does not see unhandled intrinsics (panvk does this in panvk_lower_sysvals). */
+static void
+assign_synth_desc_indices(nir_shader *nir, struct synth_desc_ctx *ctx)
+{
+   /* Also seed array sizes from NIR uniform/buffer variables when available. */
+   nir_foreach_variable_with_modes(var, nir,
+                                   nir_var_uniform | nir_var_mem_ubo |
+                                      nir_var_mem_ssbo | nir_var_image) {
+      uint32_t cnt = 1;
+      if (glsl_type_is_array(var->type)) {
+         unsigned sz = glsl_get_aoa_size(var->type);
+         cnt = sz > 0 ? sz : UINT32_MAX;
+      }
+      enum synth_desc_kind kind = SYNTH_DESC_BUFFER;
+      const struct glsl_type *leaf = glsl_without_array(var->type);
+      if (glsl_type_is_sampler(leaf)) {
+         kind = glsl_sampler_type_is_shadow(leaf) ||
+                      glsl_get_sampler_dim(leaf) != GLSL_SAMPLER_DIM_BUF
+                   ? SYNTH_DESC_COMBINED_IMAGE_SAMPLER
+                   : SYNTH_DESC_TEX_OR_IMG;
+      } else if (glsl_type_is_image(leaf)) {
+         kind = SYNTH_DESC_TEX_OR_IMG;
+      }
+      record_synth_binding(ctx, var->data.descriptor_set, var->data.binding,
+                           kind, cnt);
+   }
+
+   nir_shader_instructions_pass(nir, collect_synth_desc_instr,
+                                nir_metadata_all, ctx);
+
+   for (uint32_t s = 0; s < MAX_SETS; s++) {
+      uint32_t idx = 0;
+      for (uint32_t b = 0; b < ctx->sets[s].max_binding; b++) {
+         struct synth_binding_info *info = &ctx->sets[s].bindings[b];
+         if (info->kind == SYNTH_DESC_NONE)
+            continue;
+         info->desc_idx = idx;
+         uint32_t stride =
+            (info->kind == SYNTH_DESC_COMBINED_IMAGE_SAMPLER) ? 2u : 1u;
+         uint32_t cnt =
+            (info->desc_count == 0 || info->desc_count == UINT32_MAX)
+               ? 1u
+               : info->desc_count;
+         idx += cnt * stride;
+      }
+      ctx->sets[s].total_descs = idx;
+   }
+}
+
+static nir_def *
+synth_res_handle(nir_builder *b, const struct synth_desc_ctx *ctx,
+                 uint32_t set, uint32_t binding, bool is_sampler,
+                 nir_def *array_idx)
+{
+   assert(set < MAX_SETS && binding < MAX_BINDINGS_PER_SET);
+   const struct synth_binding_info *info = &ctx->sets[set].bindings[binding];
+   uint32_t sub_off =
+      (is_sampler && info->kind == SYNTH_DESC_COMBINED_IMAGE_SAMPLER) ? 1u : 0u;
+   uint32_t base = pan_res_handle(set + 1, info->desc_idx + sub_off);
+   if (!array_idx)
+      return nir_imm_int(b, base);
+
+   uint32_t stride =
+      (info->kind == SYNTH_DESC_COMBINED_IMAGE_SAMPLER) ? 2u : 1u;
+   nir_def *scaled =
+      stride > 1 ? nir_imul_imm(b, array_idx, stride) : array_idx;
+   return nir_iadd_imm(b, scaled, base);
+}
+
 static bool
-lower_post_sysvals(nir_builder *b, nir_instr *instr, void *data)
+lower_vk_descriptors_v9(nir_builder *b, nir_instr *instr, void *data)
+{
+   const struct synth_desc_ctx *ctx = data;
+
+   if (instr->type == nir_instr_type_intrinsic) {
+      nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+      b->cursor = nir_before_instr(instr);
+
+      switch (intr->intrinsic) {
+      case nir_intrinsic_vulkan_resource_index: {
+         uint32_t set = nir_intrinsic_desc_set(intr);
+         uint32_t binding = nir_intrinsic_binding(intr);
+         uint32_t desc_idx = 0;
+         uint32_t array_size = 1;
+         if (set < MAX_SETS && binding < MAX_BINDINGS_PER_SET) {
+            const struct synth_binding_info *info =
+               &ctx->sets[set].bindings[binding];
+            desc_idx = pan_res_handle(set + 1, info->desc_idx);
+            if (info->desc_count > 0)
+               array_size = info->desc_count;
+         } else {
+            desc_idx = pan_res_handle(set + 1, binding);
+         }
+
+         nir_def *c = nir_vec3(b, nir_imm_int(b, desc_idx), intr->src[0].ssa,
+                               nir_imm_int(b, array_size - 1));
+         nir_def_replace(&intr->def, c);
+         return true;
+      }
+
+      case nir_intrinsic_vulkan_resource_reindex: {
+         nir_def *old = intr->src[0].ssa;
+         nir_def *new_idx =
+            nir_iadd(b, nir_channel(b, old, 1), intr->src[1].ssa);
+         nir_def *c = nir_vec3(b, nir_channel(b, old, 0), new_idx,
+                               nir_channel(b, old, 2));
+         nir_def_replace(&intr->def, c);
+         return true;
+      }
+
+      case nir_intrinsic_load_vulkan_descriptor: {
+         nir_def *res_index = intr->src[0].ssa;
+         nir_def *first_desc = nir_channel(b, res_index, 0);
+         nir_def *array_idx = nir_channel(b, res_index, 1);
+         nir_def *array_max = nir_channel(b, res_index, 2);
+         if (ctx->add_bounds_checks)
+            array_idx = nir_umin(b, array_idx, array_max);
+         nir_def *addr =
+            nir_vec3(b, first_desc, array_idx, nir_imm_int(b, 0));
+         nir_def_replace(&intr->def, addr);
+         return true;
+      }
+
+      case nir_intrinsic_load_constant: {
+         nir_def *offset =
+            nir_iadd_imm(b, intr->src[0].ssa, nir_intrinsic_base(intr));
+         nir_def *base = nir_load_constant_base_ptr(b, 1, 64);
+         nir_def *addr = nir_iadd(b, base, nir_u2u64(b, offset));
+         nir_def *val = nir_load_global_constant(
+            b, intr->def.num_components, intr->def.bit_size, addr,
+            .access = ACCESS_CAN_REORDER | ACCESS_NON_WRITEABLE,
+            .align_mul = nir_intrinsic_align_mul(intr),
+            .align_offset = nir_intrinsic_align_offset(intr));
+         nir_def_replace(&intr->def, val);
+         return true;
+      }
+
+      case nir_intrinsic_image_deref_store:
+      case nir_intrinsic_image_deref_load:
+      case nir_intrinsic_image_deref_atomic:
+      case nir_intrinsic_image_deref_atomic_swap:
+      case nir_intrinsic_image_deref_size:
+      case nir_intrinsic_image_deref_samples: {
+         nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+         uint32_t set, binding, max_idx;
+         nir_def *idx_ssa;
+         get_deref_binding_info(deref, &set, &binding, &idx_ssa, &max_idx);
+         nir_def *handle =
+            synth_res_handle(b, ctx, set, binding, false, idx_ssa);
+         nir_rewrite_image_intrinsic(intr, handle,
+                                     nir_image_intrinsic_type_default);
+         return true;
+      }
+
+      default:
+         return false;
+      }
+   } else if (instr->type == nir_instr_type_tex) {
+      nir_tex_instr *tex = nir_instr_as_tex(instr);
+      b->cursor = nir_before_instr(instr);
+
+      int tex_idx = nir_tex_instr_src_index(tex, nir_tex_src_texture_deref);
+      if (tex_idx >= 0) {
+         nir_deref_instr *deref = nir_src_as_deref(tex->src[tex_idx].src);
+         uint32_t set, binding, max_idx;
+         nir_def *idx_ssa;
+         get_deref_binding_info(deref, &set, &binding, &idx_ssa, &max_idx);
+         nir_def *handle =
+            synth_res_handle(b, ctx, set, binding, false, idx_ssa);
+         nir_tex_instr_remove_src(tex, tex_idx);
+         nir_tex_instr_add_src(tex, nir_tex_src_texture_handle, handle);
+      }
+
+      int smp_idx = nir_tex_instr_src_index(tex, nir_tex_src_sampler_deref);
+      if (smp_idx >= 0) {
+         nir_deref_instr *deref = nir_src_as_deref(tex->src[smp_idx].src);
+         uint32_t set, binding, max_idx;
+         nir_def *idx_ssa;
+         get_deref_binding_info(deref, &set, &binding, &idx_ssa, &max_idx);
+         nir_def *handle =
+            synth_res_handle(b, ctx, set, binding, true, idx_ssa);
+         nir_tex_instr_remove_src(tex, smp_idx);
+         nir_tex_instr_add_src(tex, nir_tex_src_sampler_handle, handle);
+      }
+      return tex_idx >= 0 || smp_idx >= 0;
+   }
+
+   return false;
+}
+
+static bool
+is_robust_ssbo_intr(const nir_intrinsic_instr *intr, UNUSED const void *data)
+{
+   switch (intr->intrinsic) {
+   case nir_intrinsic_store_ssbo:
+   case nir_intrinsic_ssbo_atomic:
+   case nir_intrinsic_ssbo_atomic_swap:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static bool
+valhall_lower_get_ssbo_size(struct nir_builder *b, nir_intrinsic_instr *intr,
+                            UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_get_ssbo_size)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   nir_def *res_handle = nir_channel(b, intr->src[0].ssa, 0);
+   nir_def *table_idx = nir_ushr_imm(b, res_handle, 24);
+   nir_def *res_idx = nir_iand_imm(b, res_handle, BITFIELD_MASK(24));
+   nir_def *res_table = nir_ior_imm(b, table_idx, pan_res_handle(62, 0));
+   nir_def *buf_idx = nir_iadd(b, res_idx, nir_channel(b, intr->src[0].ssa, 1));
+   nir_def *desc_offset = nir_imul_imm(b, buf_idx, PANVK_DESCRIPTOR_SIZE);
+   nir_def *size = nir_load_ubo(
+      b, 1, 32, res_table, nir_iadd_imm(b, desc_offset, 4), .range = ~0u,
+      .align_mul = PANVK_DESCRIPTOR_SIZE, .align_offset = 4);
+
+   nir_def_replace(&intr->def, size);
+   return true;
+}
+
+static bool
+valhall_pack_buf_idx(nir_builder *b, nir_instr *instr, UNUSED void *data)
+{
+   if (instr->type != nir_instr_type_intrinsic)
+      return false;
+
+   nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+   unsigned index_src;
+
+   switch (intrin->intrinsic) {
+   case nir_intrinsic_load_ubo:
+   case nir_intrinsic_load_ssbo:
+   case nir_intrinsic_ssbo_atomic:
+   case nir_intrinsic_ssbo_atomic_swap:
+      index_src = 0;
+      break;
+   case nir_intrinsic_store_ssbo:
+      index_src = 1;
+      break;
+   default:
+      return false;
+   }
+
+   nir_def *index = intrin->src[index_src].ssa;
+   if (index->num_components == 1)
+      return false;
+
+   b->cursor = nir_before_instr(&intrin->instr);
+   nir_def *packed_index =
+      nir_iadd(b, nir_channel(b, index, 0), nir_channel(b, index, 1));
+   nir_src_rewrite(&intrin->src[index_src], packed_index);
+   return true;
+}
+
+/* --- panvk_lower_non_uniform (from panvk_vX_shader.c) ------------------- */
+
+#if PAN_ARCH >= 10
+static bool
+mark_all_access_non_uniform(UNUSED nir_builder *b, nir_instr *instr,
+                            UNUSED void *data)
+{
+   switch (instr->type) {
+   case nir_instr_type_tex: {
+      nir_tex_instr *tex = nir_instr_as_tex(instr);
+      tex->texture_non_uniform = true;
+      tex->sampler_non_uniform = true;
+      return true;
+   }
+   case nir_instr_type_intrinsic: {
+      nir_intrinsic_instr *intrin = nir_instr_as_intrinsic(instr);
+      switch (intrin->intrinsic) {
+      case nir_intrinsic_load_ubo:
+      case nir_intrinsic_load_ssbo:
+      case nir_intrinsic_store_ssbo:
+      case nir_intrinsic_ssbo_atomic:
+      case nir_intrinsic_ssbo_atomic_swap:
+      case nir_intrinsic_image_load:
+      case nir_intrinsic_image_sparse_load:
+      case nir_intrinsic_image_store:
+      case nir_intrinsic_image_atomic:
+      case nir_intrinsic_image_atomic_swap:
+      case nir_intrinsic_image_size:
+      case nir_intrinsic_image_samples:
+         nir_intrinsic_set_access(
+            intrin, nir_intrinsic_access(intrin) | ACCESS_NON_UNIFORM);
+         return true;
+      default:
+         return false;
+      }
+   }
+   default:
+      return false;
+   }
+}
+#endif
+
+static bool
+standalone_can_merge_workgroups(nir_shader *nir)
+{
+   if (!mesa_shader_stage_uses_workgroup(nir->info.stage))
+      return false;
+
+   bool allow_merging_workgroups = valhall_can_merge_workgroups(nir);
+   if (allow_merging_workgroups) {
+      nir->options = pan_get_nir_shader_compiler_options(
+         PAN_ARCH, MESA_SHADER_COMPUTE, true);
+      nir_foreach_function_impl(impl, nir)
+         nir_progress(true, impl, ~nir_metadata_divergence);
+   }
+   return allow_merging_workgroups;
+}
+
+static void
+standalone_lower_non_uniform(nir_shader *nir, bool allow_merging_workgroups)
+{
+#if PAN_ARCH >= 10
+   if (allow_merging_workgroups)
+      NIR_PASS(_, nir, nir_shader_instructions_pass,
+               mark_all_access_non_uniform,
+               nir_metadata_control_flow | nir_metadata_live_defs |
+                  nir_metadata_instr_index,
+               NULL);
+#endif
+
+   enum nir_lower_non_uniform_access_type types =
+      nir_lower_non_uniform_ubo_access |
+      nir_lower_non_uniform_ssbo_access |
+      nir_lower_non_uniform_texture_access |
+      nir_lower_non_uniform_texture_query |
+      nir_lower_non_uniform_image_access |
+      nir_lower_non_uniform_image_query |
+      nir_lower_non_uniform_get_ssbo_size;
+
+   if (allow_merging_workgroups ||
+       nir_has_non_uniform_access(nir, types)) {
+      NIR_PASS(_, nir, nir_opt_non_uniform_access);
+      struct nir_lower_non_uniform_access_options opts = {
+         .types = types,
+      };
+      NIR_PASS(_, nir, nir_lower_non_uniform_access, &opts);
+   }
+}
+
+/* --- panvk_lower_sysvals & lower_load_push_consts ----------------------- */
+
+static bool
+panvk_lower_sysvals(nir_builder *b, nir_instr *instr, UNUSED void *data)
 {
    if (instr->type != nir_instr_type_intrinsic)
       return false;
 
    nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
-   if (intr->intrinsic == nir_intrinsic_load_viewport_scale ||
-       intr->intrinsic == nir_intrinsic_load_viewport_offset) {
-      b->cursor = nir_before_instr(instr);
-      float v = (intr->intrinsic == nir_intrinsic_load_viewport_scale) ? 1.0f
-                                                                       : 0.0f;
-      nir_def *c = nir_imm_vec3(b, v, v, v);
-      nir_def_rewrite_uses(&intr->def, c);
-      nir_instr_remove(instr);
-      return true;
+   unsigned bit_size = intr->def.bit_size;
+   nir_def *val = NULL;
+   b->cursor = nir_before_instr(instr);
+
+   switch (intr->intrinsic) {
+   case nir_intrinsic_load_base_workgroup_id:
+      val = load_sysval(b, compute, bit_size, base);
+      break;
+   case nir_intrinsic_load_num_workgroups:
+      val = load_sysval(b, compute, bit_size, num_work_groups);
+      break;
+   case nir_intrinsic_load_workgroup_size:
+      val = load_sysval(b, compute, bit_size, local_group_size);
+      break;
+   case nir_intrinsic_load_viewport_scale:
+      val = load_sysval(b, graphics, bit_size, viewport.scale);
+      break;
+   case nir_intrinsic_load_viewport_offset:
+      val = load_sysval(b, graphics, bit_size, viewport.offset);
+      break;
+   case nir_intrinsic_load_first_vertex:
+      val = load_sysval(b, graphics, bit_size, vs.first_vertex);
+      break;
+   case nir_intrinsic_load_base_instance:
+      val = load_sysval(b, graphics, bit_size, vs.base_instance);
+      break;
+   case nir_intrinsic_load_noperspective_varyings_pan:
+      assert(b->shader->info.stage == MESA_SHADER_VERTEX);
+      val = load_sysval(b, graphics, bit_size, vs.noperspective_varyings);
+      break;
+   case nir_intrinsic_load_view_index:
+      val = nir_imm_zero(b, 1, 32);
+      break;
+   case nir_intrinsic_load_layer_id:
+      val = nir_load_frame_arg_pan(b);
+      val = nir_extract_u8_imm(b, nir_u2u32(b, val), 0);
+      break;
+   case nir_intrinsic_load_draw_id:
+      if (PAN_ARCH >= 10)
+         return false;
+      assert(b->shader->info.stage == MESA_SHADER_VERTEX);
+      val = nir_imm_int(b, 0);
+      break;
+   case nir_intrinsic_load_printf_buffer_address:
+      val = load_sysval(b, common, bit_size, printf_buffer_address);
+      break;
+   case nir_intrinsic_load_blend_descriptor_pan: {
+      uint32_t loc = nir_intrinsic_base(intr);
+      val = load_sysval(b, graphics, bit_size, fs.blend_descs[loc]);
+      break;
+   }
+   case nir_intrinsic_load_input_attachment_target_pan: {
+      nir_def *ia_info =
+         load_sysval_entry(b, graphics, bit_size, iam, intr->src[0].ssa);
+      val = nir_channel(b, ia_info, 0);
+      break;
+   }
+   case nir_intrinsic_load_input_attachment_conv_pan: {
+      nir_def *ia_info =
+         load_sysval_entry(b, graphics, bit_size, iam, intr->src[0].ssa);
+      val = nir_channel(b, ia_info, 1);
+      break;
+   }
+   case nir_intrinsic_load_ro_sink_address_poly:
+   case nir_intrinsic_load_stat_query_address_poly:
+      val = nir_imm_int64(b, PAN_SHADER_OOB_ADDRESS);
+      break;
+   case nir_intrinsic_load_vertex_param_buffer_poly:
+      val = load_sysval(b, graphics, bit_size, poly.vertex_params);
+      break;
+   case nir_intrinsic_load_geometry_param_buffer_poly:
+      val = load_sysval(b, graphics, bit_size, poly.geometry_params);
+      break;
+   case nir_intrinsic_load_rasterization_stream:
+      val = load_sysval(b, graphics, bit_size, poly.rasterization_stream);
+      break;
+   case nir_intrinsic_load_provoking_last:
+      val = load_sysval(b, graphics, bit_size, poly.provoking_vertex);
+      break;
+   default:
+      return false;
    }
 
-   if (intr->intrinsic == nir_intrinsic_load_base_workgroup_id) {
-      /* The base workgroup id is always 0. */
-      b->cursor = nir_before_instr(instr);
-      nir_def *c = nir_imm_zero(b, intr->def.num_components, intr->def.bit_size);
-      nir_def_rewrite_uses(&intr->def, c);
-      nir_instr_remove(instr);
-      return true;
+   assert(val->num_components == intr->def.num_components);
+   b->cursor = nir_after_instr(instr);
+   nir_def_rewrite_uses(&intr->def, val);
+   return true;
+}
+
+static bool
+collect_push_constant(UNUSED struct nir_builder *b, nir_intrinsic_instr *intr,
+                      void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_push_constant)
+      return false;
+
+   struct standalone_fau_info *fau = data;
+   uint32_t base = nir_intrinsic_base(intr);
+   bool is_sysval = base >= SYSVALS_PUSH_CONST_BASE;
+   uint32_t offset, size;
+
+   if (is_sysval)
+      base -= SYSVALS_PUSH_CONST_BASE;
+
+   if (!nir_src_is_const(intr->src[0])) {
+      offset = base;
+      size = nir_intrinsic_range(intr);
+      shader_use_sysval(fau, common, push_uniforms);
+   } else {
+      offset = base + nir_src_as_uint(intr->src[0]);
+      size = (intr->def.bit_size / 8) * intr->def.num_components;
    }
 
-   if (intr->intrinsic == nir_intrinsic_load_noperspective_varyings_pan) {
-      /* No noperspective varyings in the standalone flow. */
-      b->cursor = nir_before_instr(instr);
-      nir_def *c = nir_imm_zero(b, intr->def.num_components, intr->def.bit_size);
-      nir_def_rewrite_uses(&intr->def, c);
-      nir_instr_remove(instr);
-      return true;
+   if (is_sysval)
+      fau_use_range(fau->used_sysvals, MAX_SYSVAL_FAUS, offset, size);
+   else
+      fau_use_range(fau->used_push_consts, MAX_PUSH_CONST_FAUS, offset, size);
+
+   return true;
+}
+
+static bool
+move_push_constant(struct nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_push_constant)
+      return false;
+
+   const struct standalone_fau_info *fau = data;
+   unsigned base = nir_intrinsic_base(intr);
+   bool is_sysval = base >= SYSVALS_PUSH_CONST_BASE;
+
+   if (is_sysval)
+      base -= SYSVALS_PUSH_CONST_BASE;
+
+   b->cursor = nir_before_instr(&intr->instr);
+
+   if (nir_src_is_const(intr->src[0])) {
+      unsigned offset = base + nir_src_as_uint(intr->src[0]);
+      offset = is_sysval ? shader_remapped_sysval_offset(fau, offset)
+                         : shader_remapped_push_const_offset(fau, offset);
+
+      nir_src_rewrite(&intr->src[0], nir_imm_int(b, offset));
+      nir_intrinsic_set_base(intr, 0);
+      nir_intrinsic_set_range(intr, 0);
+   } else {
+      unsigned push_const_buf_offset = shader_remapped_sysval_offset(
+         fau, sysval_offset(common, push_uniforms));
+      nir_def *push_const_buf = nir_load_push_constant(
+         b, 1, 64, nir_imm_int(b, push_const_buf_offset));
+      unsigned push_const_offset =
+         is_sysval ? shader_remapped_sysval_offset(fau, base)
+                   : shader_remapped_push_const_offset(fau, base);
+      nir_def *offset = nir_iadd_imm(b, intr->src[0].ssa, push_const_offset);
+      unsigned align = nir_combined_align(nir_intrinsic_align_mul(intr),
+                                          nir_intrinsic_align_offset(intr));
+      align = MIN2(align, FAU_WORD_SIZE);
+      nir_def *value = nir_load_global(
+         b, intr->def.num_components, intr->def.bit_size,
+         nir_iadd(b, push_const_buf, nir_u2u64(b, offset)),
+         .align_mul = align);
+      nir_def_replace(&intr->def, value);
    }
 
-   return false;
+   return true;
+}
+
+static void
+lower_load_push_consts(nir_shader *nir, struct standalone_fau_info *fau)
+{
+   bool progress = false;
+   do {
+      progress = false;
+      NIR_PASS(progress, nir, nir_opt_copy_prop);
+      NIR_PASS(progress, nir, nir_opt_remove_phis);
+      NIR_PASS(progress, nir, nir_opt_dce);
+      NIR_PASS(progress, nir, nir_opt_dead_cf);
+      NIR_PASS(progress, nir, nir_opt_cse);
+
+      nir_opt_peephole_select_options peephole_select_options = {
+         .limit = 64,
+         .expensive_alu_ok = true,
+      };
+      NIR_PASS(progress, nir, nir_opt_peephole_select,
+               &peephole_select_options);
+      NIR_PASS(progress, nir, nir_opt_algebraic);
+      NIR_PASS(progress, nir, nir_opt_constant_folding);
+   } while (progress);
+
+   if (nir->info.stage == MESA_SHADER_FRAGMENT) {
+      STATIC_ASSERT(
+         offsetof(struct panvk_graphics_sysvals, blend.constants) == 0 &&
+         sizeof(((struct panvk_graphics_sysvals *)NULL)->blend.constants) ==
+            16);
+      shader_use_sysval(fau, graphics, blend.constants);
+   }
+
+   progress = false;
+   NIR_PASS(progress, nir, nir_shader_intrinsics_pass, collect_push_constant,
+            nir_metadata_all, fau);
+
+   fau->sysval_count = BITSET_COUNT(fau->used_sysvals);
+   assert(fau->sysval_count <= FAU_WORD_COUNT - 32 && "too many sysval FAUs");
+   fau->total_count = fau->sysval_count + BITSET_COUNT(fau->used_push_consts);
+   assert(fau->total_count <= FAU_WORD_COUNT &&
+          "asking for more FAUs than the hardware has to offer");
+
+   if (!progress)
+      return;
+
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, move_push_constant,
+            nir_metadata_control_flow, fau);
 }
 
 /* --- SPIR-V front-end helpers ------------------------------------------- */
 
-/* Read a NUL-terminated string packed 4 chars per word starting at word
- * index `start`.  Returns the offset just past the terminator. */
 static unsigned
 read_packed_string(const uint32_t *words, unsigned start, char *out,
                    size_t out_sz)
@@ -194,7 +969,6 @@ read_packed_string(const uint32_t *words, unsigned start, char *out,
    }
 }
 
-/* Detect the shader stage and entry point name from the first OpEntryPoint. */
 static mesa_shader_stage
 detect_stage(const uint32_t *words, size_t word_count, char *entry,
              size_t entry_sz)
@@ -202,7 +976,7 @@ detect_stage(const uint32_t *words, size_t word_count, char *entry,
    mesa_shader_stage stage = MESA_SHADER_COMPUTE;
    strcpy(entry, "main");
 
-   unsigned i = 5; /* skip magic, version, generator, bound, schema */
+   unsigned i = 5;
    while (i < word_count) {
       uint32_t inst = words[i];
       unsigned wc = inst >> 16;
@@ -212,8 +986,6 @@ detect_stage(const uint32_t *words, size_t word_count, char *entry,
 
       if (op == SpvOpEntryPoint) {
          SpvExecutionModel model = (SpvExecutionModel)words[i + 1];
-         /* word[i+2] is the entry-point function id; the name string starts
-          * at word[i+3]. */
          read_packed_string(words, i + 3, entry, entry_sz);
 
          switch (model) {
@@ -281,37 +1053,52 @@ read_spirv(const char *path, size_t *size_out)
 int
 main(int argc, char **argv)
 {
-   if (argc < 3) {
+   const char *in_path = NULL;
+   const char *out_path = NULL;
+   bool robust = getenv("PANVK_ROBUST") && atoi(getenv("PANVK_ROBUST")) != 0;
+   bool no_idvs = false;
+
+   for (int i = 1; i < argc; i++) {
+      if (strcmp(argv[i], "--robust") == 0) {
+         robust = true;
+      } else if (strcmp(argv[i], "--no-idvs") == 0) {
+         no_idvs = true;
+      } else if (strcmp(argv[i], "--kraid") == 0) {
+         setenv("PAN_USE_KRAID", "all", 1);
+      } else if (strcmp(argv[i], "--no-kraid") == 0) {
+         setenv("PAN_USE_KRAID", "0", 1);
+      } else if (!in_path) {
+         in_path = argv[i];
+      } else if (!out_path) {
+         out_path = argv[i];
+      } else {
+         fprintf(stderr, "panfrost_vk_compile: unexpected argument %s\n",
+                 argv[i]);
+         return 1;
+      }
+   }
+
+   if (!in_path || !out_path) {
       fprintf(stderr,
-              "Usage: %s <input.spv> <output.bin>\n"
+              "Usage: %s [--kraid|--no-kraid] [--robust] [--no-idvs] "
+              "<input.spv> <output.bin>\n"
               "  (built for Valhall arch v%d)\n",
               argv[0], PAN_ARCH);
       return 1;
    }
 
-   /* Default to the Bifrost/Valhall C backend.  The Rust Kraid backend is the
-    * default for arch >= 9, but its standalone NIR path rejects the
-    * lea_attr_pan intrinsic emitted by the vertex-input lowering, so vertex
-    * shaders would abort.  Respect an explicit PAN_USE_KRAID if the caller
-    * set one (overwrite == 0). */
-   setenv("PAN_USE_KRAID", "0", 0);
-
    size_t spirv_size = 0;
-   uint32_t *words = read_spirv(argv[1], &spirv_size);
+   uint32_t *words = read_spirv(in_path, &spirv_size);
    if (!words)
       return 1;
 
    if (spirv_size < 20 || words[0] != 0x07230203u) {
       fprintf(stderr, "panfrost_vk_compile: %s is not a SPIR-V binary\n",
-              argv[1]);
+              in_path);
       free(words);
       return 1;
    }
 
-   /* SPIR-V 1.4+ requires StorageBuffer/Uniform OpVariables to be listed in
-    * the OpEntryPoint interface.  Mali DDK tolerates their omission while Mesa
-    * skips unlisted globals, so clamp the advertised version to 1.3 to keep
-    * the interface list optional. */
    if (words[SPIRV_VERSION_WORD] > SPIRV_VERSION_1_3)
       words[SPIRV_VERSION_WORD] = SPIRV_VERSION_1_3;
 
@@ -321,15 +1108,11 @@ main(int argc, char **argv)
 
    glsl_type_singleton_init_or_ref();
 
-   /* NULL capabilities => use the full implemented_capabilities set.  The
-    * address formats match panvk_get_spirv_options() for v9+, except that we
-    * use the 1-component 32bit_index_offset for UBO/SSBO (see the note above
-    * the descriptor lowering). */
    struct spirv_to_nir_options sopts = {
       .environment = NIR_SPIRV_VULKAN,
       .capabilities = NULL,
-      .ubo_addr_format = nir_address_format_32bit_index_offset,
-      .ssbo_addr_format = nir_address_format_32bit_index_offset,
+      .ubo_addr_format = nir_address_format_vec2_index_32bit_offset,
+      .ssbo_addr_format = nir_address_format_vec2_index_32bit_offset,
       .phys_ssbo_addr_format = nir_address_format_64bit_global,
       .push_const_addr_format = nir_address_format_32bit_offset,
       .shared_addr_format = nir_address_format_32bit_offset,
@@ -349,8 +1132,7 @@ main(int argc, char **argv)
       return 1;
    }
 
-   /* Early lowering.  The Vulkan driver performs the equivalent before
-    * create_shader(); we need it here to handle multi-function shaders. */
+   /* Early lowering before panvk_preprocess_nir(). */
    NIR_PASS(_, nir, nir_lower_variable_initializers, nir_var_all);
    NIR_PASS(_, nir, nir_lower_returns);
    NIR_PASS(_, nir, nir_inline_functions);
@@ -363,11 +1145,6 @@ main(int argc, char **argv)
 
    if (stage == MESA_SHADER_FRAGMENT)
       NIR_PASS(_, nir, nir_opt_vectorize_io_vars, nir_var_shader_out);
-
-   /* NOTE: panvk runs nir_lower_io_vars_to_temporaries(entrypoint, out) here,
-    * but that pass asserts on Vulkan interface blocks (e.g. gl_PerVertex) and
-    * nir_split_struct_vars does not split builtin interface blocks.  nir_lower_io
-    * below handles blocks directly, so we skip it. */
 
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
    NIR_PASS(_, nir, nir_split_var_copies);
@@ -388,8 +1165,6 @@ main(int argc, char **argv)
    if (stage == MESA_SHADER_FRAGMENT)
       NIR_PASS(_, nir, nir_lower_wpos_center);
 
-   /* Inline the shader-core count sysval.  panvk reads this from the device
-    * props (shader_present); offline we assume a single core (max id 0). */
    NIR_PASS(_, nir, nir_inline_sysval,
             nir_intrinsic_load_core_max_id_arm, 0);
 
@@ -398,48 +1173,56 @@ main(int argc, char **argv)
    /* --- panvk_lower_nir (v9+ specialization) --------------------------- */
    NIR_PASS(_, nir, nir_opt_large_constants, NULL, 32);
 
-   /* Lower MSAA image load/stores (no-op if the shader has none). */
-   NIR_PASS(_, nir, pan_nir_lower_image_ms);
+   NIR_PASS(_, nir, panvk_nir_lower_cooperative_matrix,
+            pan_subgroup_size(PAN_ARCH));
 
    const nir_opt_access_options access_options = {
       .is_vulkan = true,
    };
    NIR_PASS(_, nir, nir_opt_access, &access_options);
 
-   /* Full panvk descriptor lowering needs VkDescriptorSetLayout; collapse
-    * descriptors to packed immediates instead.  This runs where panvk does
-    * descriptor lowering (after pan_preprocess_nir's nir_lower_tex, before
-    * explicit IO). */
-   NIR_PASS(_, nir, nir_shader_instructions_pass,
-            lower_vk_descriptors_and_tex, nir_metadata_control_flow, NULL);
+   /* NOTE: nir_vk_lower_ycbcr_tex is intentionally omitted when no
+    * VkSamplerYcbcrConversion state is supplied; without app-created YCbCr
+    * conversions, lookup_ycbcr_conversion returns NULL and it is a no-op. */
+
+   struct synth_desc_ctx desc_ctx = {
+      .add_bounds_checks = robust,
+   };
+   assign_synth_desc_indices(nir, &desc_ctx);
+   NIR_PASS(_, nir, nir_shader_instructions_pass, lower_vk_descriptors_v9,
+            nir_metadata_control_flow, &desc_ctx);
 
    NIR_PASS(_, nir, nir_split_var_copies);
    NIR_PASS(_, nir, nir_lower_var_copies);
    NIR_PASS(_, nir, nir_lower_memcpy);
 
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
-            nir_address_format_32bit_index_offset);
+            nir_address_format_vec2_index_32bit_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ssbo,
-            nir_address_format_32bit_index_offset);
+            nir_address_format_vec2_index_32bit_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_push_const,
             nir_address_format_32bit_offset);
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
 
-   /* NOTE: panvk runs nir_lower_robust_access here, but it emits
-    * get_ssbo_size, which needs the descriptor table built by the full panvk
-    * descriptor lowering.  Skip it (no robustness in the standalone flow). */
+   if (robust) {
+      NIR_PASS(_, nir, nir_lower_robust_access, is_robust_ssbo_intr, NULL);
+      NIR_PASS(_, nir, nir_opt_constant_folding);
+      NIR_PASS(_, nir, nir_opt_dce);
+   }
+
+   NIR_PASS(_, nir, nir_shader_intrinsics_pass, valhall_lower_get_ssbo_size,
+            nir_metadata_control_flow, NULL);
+   NIR_PASS(_, nir, nir_shader_instructions_pass, valhall_pack_buf_idx,
+            nir_metadata_control_flow, NULL);
 
    if (mesa_shader_stage_uses_workgroup(stage)) {
       NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
-               glsl_get_cl_type_size_align);
+               shared_type_info);
       NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared,
                nir_address_format_32bit_offset);
    }
 
-   /* Zero-initialize shared memory if the shader requests it (matching
-    * panvk).  Re-lower compute sysvals afterwards for the generated
-    * load_invocation_id. */
    if (nir->info.zero_initialize_shared_memory && nir->info.shared_size > 0) {
       nir->info.shared_size = align(nir->info.shared_size, 16);
       NIR_PASS(_, nir, nir_zero_initialize_shared_memory,
@@ -452,8 +1235,6 @@ main(int argc, char **argv)
 
    /* --- panvk_lower_nir_io (VS/FS only) -------------------------------- */
    if (stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_FRAGMENT) {
-      /* Assign driver locations so varyings get distinct bases (panvk does
-       * this from the vertex-input / fragment state). */
       nir_assign_io_var_locations(nir, nir_var_shader_in);
       nir_assign_io_var_locations(nir, nir_var_shader_out);
 
@@ -474,9 +1255,12 @@ main(int argc, char **argv)
    /* --- panvk_compile_nir ---------------------------------------------- */
    struct pan_compile_inputs inputs = {
       .arch = PAN_ARCH,
-      .model = NULL, /* only the arch is known when compiling offline */
-      .no_idvs = true,
-      .fau = { .reserved = 64, .promote_immediates = true },
+      .model = NULL,
+      .no_idvs = no_idvs,
+      .robust_modes =
+         robust ? (nir_var_mem_ubo | nir_var_mem_ssbo) : 0,
+      .robust_descriptors = PAN_ARCH >= 10,
+      .fau = { .reserved = 0, .promote_immediates = true },
    };
 
    struct pan_varying_layout vlayout = {0};
@@ -486,19 +1270,28 @@ main(int argc, char **argv)
       inputs.varying_layout = &vlayout;
    }
 
+   bool allow_merging_workgroups = standalone_can_merge_workgroups(nir);
+   standalone_lower_non_uniform(nir, allow_merging_workgroups);
+
    struct pan_shader_info info = {0};
    pan_postprocess_nir(nir, &inputs, &info);
-   NIR_PASS(_, nir, nir_shader_instructions_pass, lower_post_sysvals,
+
+   struct standalone_fau_info fau = {0};
+   NIR_PASS(_, nir, nir_shader_instructions_pass, panvk_lower_sysvals,
             nir_metadata_control_flow, NULL);
+   lower_load_push_consts(nir, &fau);
+
+   inputs.fau.reserved = fau.total_count * 2;
+   inputs.fau.promote_immediates = true;
 
    struct util_dynarray binary;
    util_dynarray_init(&binary, NULL);
    pan_shader_compile(nir, &inputs, &binary, &info);
 
-   FILE *out = fopen(argv[2], "wb");
+   FILE *out = fopen(out_path, "wb");
    if (!out) {
       fprintf(stderr, "panfrost_vk_compile: cannot open %s for writing\n",
-              argv[2]);
+              out_path);
       util_dynarray_fini(&binary);
       ralloc_free(nir);
       glsl_type_singleton_decref();
@@ -510,11 +1303,14 @@ main(int argc, char **argv)
 
    uint32_t instrs = info.stats.valhall.instrs;
    fprintf(stderr,
-           "panfrost_vk_compile: %s (%s) -> %s: %u bytes, %u instructions\n",
-           entry, stage == MESA_SHADER_VERTEX   ? "vertex"
-                   : stage == MESA_SHADER_FRAGMENT ? "fragment"
-                                                   : "compute",
-           argv[2], (unsigned)binary.size, instrs);
+           "panfrost_vk_compile: %s (%s, %s, fau=%u) -> %s: %u bytes, "
+           "%u instructions\n",
+           entry,
+           stage == MESA_SHADER_VERTEX   ? "vertex"
+           : stage == MESA_SHADER_FRAGMENT ? "fragment"
+                                           : "compute",
+           pan_use_kraid(PAN_ARCH, stage, false) ? "kraid" : "bifrost",
+           fau.total_count, out_path, (unsigned)binary.size, instrs);
 
    util_dynarray_fini(&binary);
    ralloc_free(nir);
