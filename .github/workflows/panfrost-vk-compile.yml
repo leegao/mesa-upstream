@@ -4,6 +4,12 @@ name: Panfrost Vulkan SPIR-V Compiler
 # SPIR-V (Vertex / Fragment / Compute) directly to Valhall/Bifrost ISA using
 # Mesa's libpanfrost_compiler + libnir + spirv_to_nir, with no DRM, X11,
 # Wayland or libvulkan dependency.
+#
+# Two variants are built:
+#   * non-rust   : the C Bifrost/Valhall backend only (no Rust, no bindgen).
+#   * rust-kraid : the Rust Kraid backend compiled in and used by default
+#                  (requires bindgen).  The compute smoke test is additionally
+#                  run with PAN_USE_KRAID=all to exercise the Kraid path.
 
 on:
   push:
@@ -23,8 +29,16 @@ permissions:
 
 jobs:
   build:
-    name: Build panfrost_vk_compile
+    name: Build (${{ matrix.variant }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: non-rust
+            panfrost_rust: false
+          - variant: rust-kraid
+            panfrost_rust: true
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -54,6 +68,12 @@ jobs:
         python -m pip install --upgrade pip
         pip install mako PyYAML meson ninja packaging
 
+    - name: Install bindgen (Rust variant only)
+      if: matrix.panfrost_rust
+      run: |
+        # Mesa requires bindgen >= 0.71.1; 0.72.0 and 0.73.x are known-buggy.
+        cargo install bindgen-cli --version 0.71.1 --locked
+
     - name: Configure
       env:
         LLVM_CONFIG: /usr/bin/llvm-config-21
@@ -66,7 +86,7 @@ jobs:
           -Dgallium-drivers= \
           -Dvulkan-drivers=panfrost \
           -Dprecomp-compiler=enabled \
-          -Dpanfrost-rust=false \
+          -Dpanfrost-rust=${{ matrix.panfrost_rust }} \
           -Dllvm=enabled
 
     - name: Build panfrost_vk_compile
@@ -84,8 +104,6 @@ jobs:
           exit 1
         fi
 
-        # Compile a real Vulkan compute shader and check that a non-empty
-        # Valhall binary is produced.
         cat > comp.comp <<'EOF'
         #version 450
         layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
@@ -96,13 +114,22 @@ jobs:
         }
         EOF
         glslangValidator -S comp -V comp.comp -o comp.spv
+
+        # Default backend (Bifrost for non-rust; Bifrost via the tool's
+        # PAN_USE_KRAID=0 default for the rust build).
         "$BIN" 11 comp.spv comp.bin
         test -s comp.bin
+
+        # Rust/Kraid variant: also exercise the Kraid compute path.
+        if [ "${{ matrix.panfrost_rust }}" = "true" ]; then
+          PAN_USE_KRAID=all "$BIN" 11 comp.spv comp-kraid.bin
+          test -s comp-kraid.bin
+        fi
 
     - name: Upload artifact
       if: always()
       uses: actions/upload-artifact@v4
       with:
-        name: panfrost_vk_compile
+        name: panfrost_vk_compile-${{ matrix.variant }}
         path: build-panfrost-vk/src/panfrost/clc/panfrost_vk_compile
         retention-days: 5
