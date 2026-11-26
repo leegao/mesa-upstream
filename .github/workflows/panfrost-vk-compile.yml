@@ -41,14 +41,18 @@ jobs:
           build-essential \
           llvm-21-dev \
           libclang-21-dev \
-          libdrm-dev \
+          libclc-21-dev \
+          libllvmspirvlib-21-dev \
+          libelf-dev \
+          spirv-tools \
+          spirv-tools-dev \
           bison \
           flex \
-          pkg-config \
+          libdrm-dev \
           glslang-tools \
-          spirv-tools
+          pkg-config
         python -m pip install --upgrade pip
-        pip install mako meson ninja
+        pip install mako PyYAML meson ninja packaging
 
     - name: Configure
       env:
@@ -62,6 +66,7 @@ jobs:
           -Dgallium-drivers= \
           -Dvulkan-drivers=panfrost \
           -Dprecomp-compiler=enabled \
+          -Dpanfrost-rust=false \
           -Dllvm=enabled
 
     - name: Build panfrost_vk_compile
