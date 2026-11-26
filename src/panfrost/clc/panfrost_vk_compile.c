@@ -365,8 +365,9 @@ main(int argc, char **argv)
       NIR_PASS(_, nir, nir_opt_vectorize_io_vars, nir_var_shader_out);
 
    /* NOTE: panvk runs nir_lower_io_vars_to_temporaries(entrypoint, out) here,
-    * but that pass asserts on Vulkan interface blocks (e.g. gl_PerVertex).
-    * nir_lower_io below handles blocks directly, so we skip it. */
+    * but that pass asserts on Vulkan interface blocks (e.g. gl_PerVertex) and
+    * nir_split_struct_vars does not split builtin interface blocks.  nir_lower_io
+    * below handles blocks directly, so we skip it. */
 
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
    NIR_PASS(_, nir, nir_split_var_copies);
@@ -387,10 +388,18 @@ main(int argc, char **argv)
    if (stage == MESA_SHADER_FRAGMENT)
       NIR_PASS(_, nir, nir_lower_wpos_center);
 
+   /* Inline the shader-core count sysval.  panvk reads this from the device
+    * props (shader_present); offline we assume a single core (max id 0). */
+   NIR_PASS(_, nir, nir_inline_sysval,
+            nir_intrinsic_load_core_max_id_arm, 0);
+
    pan_preprocess_nir(nir, PAN_ARCH);
 
    /* --- panvk_lower_nir (v9+ specialization) --------------------------- */
    NIR_PASS(_, nir, nir_opt_large_constants, NULL, 32);
+
+   /* Lower MSAA image load/stores (no-op if the shader has none). */
+   NIR_PASS(_, nir, pan_nir_lower_image_ms);
 
    const nir_opt_access_options access_options = {
       .is_vulkan = true,
@@ -417,11 +426,25 @@ main(int argc, char **argv)
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_global,
             nir_address_format_64bit_global);
 
+   /* NOTE: panvk runs nir_lower_robust_access here, but it emits
+    * get_ssbo_size, which needs the descriptor table built by the full panvk
+    * descriptor lowering.  Skip it (no robustness in the standalone flow). */
+
    if (mesa_shader_stage_uses_workgroup(stage)) {
       NIR_PASS(_, nir, nir_lower_vars_to_explicit_types, nir_var_mem_shared,
                glsl_get_cl_type_size_align);
       NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_shared,
                nir_address_format_32bit_offset);
+   }
+
+   /* Zero-initialize shared memory if the shader requests it (matching
+    * panvk).  Re-lower compute sysvals afterwards for the generated
+    * load_invocation_id. */
+   if (nir->info.zero_initialize_shared_memory && nir->info.shared_size > 0) {
+      nir->info.shared_size = align(nir->info.shared_size, 16);
+      NIR_PASS(_, nir, nir_zero_initialize_shared_memory,
+               nir->info.shared_size, 16);
+      NIR_PASS(_, nir, nir_lower_compute_system_values, NULL);
    }
 
    NIR_PASS(_, nir, nir_lower_global_vars_to_local);
