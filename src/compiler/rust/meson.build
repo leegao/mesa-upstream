@@ -107,6 +107,9 @@ _compiler_bindings_rs = rust.bindgen(
   c_args : [
     pre_args,
     bindgen_c_args,
+    # bindgen's clang invocation needs the same -m flags as the C compiler,
+    # otherwise the SSE headers (pulled in by USE_SSE41 on x86) fail to parse.
+    sse41_args,
   ],
   args : _compiler_bindgen_args,
   dependencies : [

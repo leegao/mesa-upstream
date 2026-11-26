@@ -50,6 +50,9 @@ _util_rust_bindgen = rust.bindgen(
   output_inline_wrapper : 'util_bindings.c',
   include_directories : inc_util,
   dependencies : [idep_mesautil],
+  # bindgen's clang invocation needs the same -m flags as the C compiler,
+  # otherwise the SSE headers (pulled in on x86) fail to parse.
+  c_args : [sse41_args],
   args : _util_bindgen_args,
 )
 

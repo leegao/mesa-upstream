@@ -90,11 +90,6 @@ jobs:
           -Dllvm=enabled
 
     - name: Build panfrost_vk_compile
-      env:
-        # USE_SSE41 is defined on x86, but bindgen's clang invocation does not
-        # get -msse4.1, so the SSE headers fail to parse.  bindgen appends this
-        # to its clang args.
-        BINDGEN_EXTRA_CLANG_ARGS: -msse4.1
       run: |
         ninja -C build-panfrost-vk src/panfrost/clc/panfrost_vk_compile
 
