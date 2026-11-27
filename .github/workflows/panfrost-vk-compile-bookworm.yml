@@ -27,9 +27,9 @@ permissions:
   contents: write
 
 env:
-  # Pinned airgapped bundle (debs + wheels + bindgen) produced by
-  # panfrost-vk-predownloaded.yml. Update the tag when regenerating the bundle.
-  PREDOWNLOADED_BUNDLE_URL: https://github.com/leegao/mesa-upstream/releases/download/bookworm-bundle-20261127-b48ae2e-1795752866/predownloaded-bookworm.tar.xz
+  # Split-out rustc + bindgen tarball (pinned tag) for the rust-kraid variant.
+  # Update the tag when regenerating the bundle.
+  RUSTC_BINDGEN_URL: https://github.com/leegao/mesa-upstream/releases/download/bookworm-bundle-20261127-d459620-1795757582/rustc-bindgen.tar.xz
 
 jobs:
   build:
@@ -73,32 +73,36 @@ jobs:
         # Newer meson/ninja than bookworm's distro packages.
         pip install --break-system-packages meson ninja mako
 
-    - name: Install Rust (>= 1.85) and bindgen 0.71.1
+    - name: Install Rust (>= 1.85) and bindgen from bundle
       if: matrix.panfrost_rust
       run: |
-        # bookworm only ships rustc 1.63, while Mesa requires rustc >= 1.85.
-        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-          | sh -s -- -y --profile minimal --default-toolchain stable
-        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-        export PATH="$HOME/.cargo/bin:$PATH"
+        # Use the prebuilt rustc + bindgen from the split-out rustc-bindgen
+        # tarball instead of rustup + `cargo install bindgen-cli` (both slow).
+        # The tarball holds a relocatable rustc-1.85.1 toolchain and bindgen.
+        curl -fsSL "$RUSTC_BINDGEN_URL" -o /tmp/rustc-bindgen.tar.xz
+        tar -xf /tmp/rustc-bindgen.tar.xz -C /tmp
+        # rustc + cargo (relocatable toolchain)
+        mkdir -p /tmp/rustc
+        tar -xf /tmp/rustc-1.85.1-x86_64.tar.xz -C /tmp/rustc
+        export PATH="/tmp/rustc/bin:$PATH"
+        echo "/tmp/rustc/bin" >> "$GITHUB_PATH"
+        # bindgen (prebuilt; Mesa requires 0.71.1, 0.72.0/0.73.x blacklisted)
+        install -m 0755 /tmp/bindgen /usr/local/bin/bindgen
         rustc --version
         cargo --version
-        # Mesa requires bindgen >= 0.71.1; 0.72.0 and 0.73.x are blacklisted.
-        cargo install bindgen-cli --version 0.71.1 --locked
         bindgen --version
 
     - name: Fetch prebuilt SPIRV-Tools 2024.1 from bundle
       run: |
         # bookworm ships SPIRV-Tools 2023.1; Mesa's CLC path needs >= 2024.1.
-        # Instead of rebuilding from source (a major bottleneck), grab the
-        # prebuilt .deb from the airgapped bundle produced by
-        # panfrost-vk-predownloaded.yml (via predownloaded/build-spirv-tools.sh).
-        curl -fsSL "$PREDOWNLOADED_BUNDLE_URL" -o /tmp/predownloaded-bookworm.tar.xz
-        tar -xf /tmp/predownloaded-bookworm.tar.xz -C /tmp
-        # The bundle's debs/spirv-tools-2024_2024.1_amd64.deb is a standalone
-        # SPIRV-Tools (no LLVM dep). bookworm's 2023.1 is not installed above,
-        # so there are no file conflicts.
-        dpkg -i /tmp/debs/spirv-tools-2024_2024.1_amd64.deb
+        # Instead of rebuilding from source (a major bottleneck), reuse the
+        # prebuilt .deb committed at predownloaded/spirv-tools.tar.xz (produced
+        # by predownloaded/build-spirv-tools.sh).
+        tar -xf predownloaded/spirv-tools.tar.xz -C /tmp
+        # The tarball holds a standalone SPIRV-Tools (no LLVM dep). Use
+        # --force-overwrite so it replaces bookworm's 2023.1 /usr/bin/spirv-*
+        # files if that package happens to be pulled in.
+        dpkg -i --force-overwrite /tmp/debs/spirv-tools-2024_2024.1_amd64.deb
         pkg-config --modversion SPIRV-Tools
 
     - name: Configure
@@ -156,6 +160,14 @@ jobs:
         glslangValidator -S vert -V vert.vert -o vert.spv
         "$BIN" --kraid vert.spv vert_kraid.bin
         test -s vert_kraid.bin
+
+        # Run the compiler over a random sample of 100 real SPIR-V shaders
+        # (predownloaded/sample_shaders.tar.xz, sampled from spirv.tar.xz).
+        tar -xf predownloaded/sample_shaders.tar.xz -C /tmp
+        for spv in /tmp/spirv_samples/*.spv; do
+          "$BIN" "$spv" /tmp/sample_out.bin || exit 1
+          test -s /tmp/sample_out.bin
+        done
 
     - name: Upload artifact
       if: always()
