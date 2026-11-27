@@ -1,0 +1,188 @@
+name: Debian Trixie Build
+
+# Build panfrost_vk_compile inside a Debian 13 (trixie) container.  Unlike the
+# bookworm workflow, trixie ships new enough native packages, so no external
+# apt.llvm.org / rustup / SPIRV-Tools source build is needed:
+#   * spirv-tools 2025.1 (native)
+#   * rustc / cargo 1.85.1 (native, satisfies Mesa's rustc >= 1.85)
+#   * llvm + clang 19 (native, satisfies the CLC path's LLVM >= 15)
+# Only bindgen-cli 0.71.1 is still installed via cargo (distros don't ship the
+# exact version Mesa requires).
+#
+# Two variants are built:
+#   * stable : the C Bifrost/Valhall backend only (no Rust, no bindgen).
+#   * kraid  : the Rust Kraid backend compiled in and used by default.
+
+on:
+  push:
+    paths:
+      - 'src/panfrost/**'
+      - 'src/compiler/**'
+      - '.github/workflows/panfrost-vk-compile-trixie.yml'
+  pull_request:
+    paths:
+      - 'src/panfrost/**'
+      - 'src/compiler/**'
+      - '.github/workflows/panfrost-vk-compile-trixie.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build panfrost_vk_compile (${{ matrix.variant }}, debian:trixie)
+    runs-on: ubuntu-latest
+    container:
+      image: debian:trixie
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: stable
+            panfrost_rust: false
+          - variant: kraid
+            panfrost_rust: true
+    steps:
+    - name: Install base tools
+      run: |
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          ca-certificates curl gnupg git
+
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Install build dependencies (native LLVM 19, SPIRV-Tools 2025.1, rustc 1.85.1)
+      run: |
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          build-essential pkg-config bison flex libdrm-dev libelf-dev \
+          python3 python3-pip python3-venv \
+          spirv-tools spirv-headers glslang-tools \
+          llvm-19-dev libclang-19-dev libclc-19-dev libllvmspirvlib-19-dev \
+          rustc cargo
+        # Newer meson/ninja than trixie's distro packages (usually fine, but
+        # pin to be safe and to get mako).
+        pip install --break-system-packages meson ninja mako
+
+    - name: Install bindgen 0.71.1
+      if: matrix.panfrost_rust
+      run: |
+        # Mesa requires bindgen >= 0.71.1; 0.72.0 and 0.73.x are blacklisted.
+        cargo install bindgen-cli --version 0.71.1 --locked
+        bindgen --version
+
+    - name: Configure
+      env:
+        LLVM_CONFIG: /usr/bin/llvm-config-19
+      run: |
+        meson setup build . \
+          -Dbuildtype=release \
+          -Dplatforms= \
+          -Dglx=disabled \
+          -Degl=disabled \
+          -Dgallium-drivers= \
+          -Dvulkan-drivers=panfrost \
+          -Dprecomp-compiler=enabled \
+          -Dpanfrost-rust=${{ matrix.panfrost_rust }} \
+          -Dllvm=enabled
+
+    - name: Build panfrost_vk_compile
+      run: |
+        ninja -C build src/panfrost/clc/panfrost_vk_compile
+
+    - name: Smoke test
+      run: |
+        BIN=build/src/panfrost/clc/panfrost_vk_compile
+        test -x "$BIN"
+
+        # With no arguments the tool must print usage and exit non-zero.
+        if "$BIN"; then
+          echo "expected panfrost_vk_compile to fail without arguments" >&2
+          exit 1
+        fi
+
+        cat > comp.comp <<'EOF'
+        #version 450
+        layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+        layout(set = 0, binding = 0) buffer Data { float values[]; };
+        void main() {
+            uint i = gl_GlobalInvocationID.x;
+            values[i] = values[i] * 2.0 + 1.0;
+        }
+        EOF
+        glslangValidator -S comp -V comp.comp -o comp.spv
+        "$BIN" --kraid comp.spv comp_kraid.bin
+        test -s comp_kraid.bin
+        "$BIN" --no-kraid comp.spv comp_bi.bin
+        test -s comp_bi.bin
+
+        cat > vert.vert <<'EOF'
+        #version 450
+        layout(location = 0) in vec4 a_pos;
+        void main() {
+            gl_Position = a_pos;
+        }
+        EOF
+        glslangValidator -S vert -V vert.vert -o vert.spv
+        "$BIN" --kraid vert.spv vert_kraid.bin
+        test -s vert_kraid.bin
+
+    - name: Upload artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: panfrost_vk_compile-trixie-${{ matrix.variant }}
+        path: build/src/panfrost/clc/panfrost_vk_compile
+        retention-days: 5
+
+  # Publish a GitHub release on manual workflow runs only. The Linux epoch in
+  # the tag guarantees uniqueness, so re-runs never collide. Both matrix
+  # variants are attached with distinct asset names.
+  release:
+    name: Publish release
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist
+
+    - name: Prepare release metadata
+      id: rel
+      run: |
+        DATE="$(date -u +%Y%m%d)"
+        COMMIT="$(echo "$GITHUB_SHA" | cut -c1-7)"
+        EPOCH="$(date -u +%s)"
+        TAG="panfrost-vk-compile-trixie-${DATE}-${COMMIT}-${EPOCH}"
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        echo "date=$DATE" >> "$GITHUB_OUTPUT"
+        echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+
+    - name: Flatten variant binaries
+      run: |
+        # download-artifact nests each matrix artifact in its own directory and
+        # both are named `panfrost_vk_compile`; copy them out under unique names.
+        mkdir -p out
+        for d in dist/*/; do
+          variant="$(basename "$d")"
+          variant="${variant#panfrost_vk_compile-trixie-}"
+          cp "$d/panfrost_vk_compile" "out/panfrost_vk_compile-trixie-${variant}"
+        done
+        ls -l out
+
+    - name: Create GitHub release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.rel.outputs.tag }}
+        name: Trixie bundle ${{ steps.rel.outputs.date }} (${{ steps.rel.outputs.commit }})
+        body: Automated panfrost_vk_compile build (Debian trixie) for ${{ steps.rel.outputs.commit }}.
+        files: out/panfrost_vk_compile-trixie-*
+        fail_on_unmatched_files: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
