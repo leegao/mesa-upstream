@@ -51,14 +51,13 @@ libpanfrost_vk_compile = static_library(
   ],
   c_args : [
     c_msvc_compat_args, no_override_init_args, soong_compat_c_args,
-    '-DPAN_ARCH=' + pan_vk_arch.to_string(),
   ],
   dependencies : [idep_vtn, idep_nir, idep_mesautil, libpanfrost_dep],
 )
 
 panfrost_vk_compile = executable(
   'panfrost_vk_compile',
-  ['panfrost_vk_compile.c'],
+  ['panfrost_vk_compile_cli.c'],
   include_directories : [
     inc_include,
     inc_src,
@@ -67,7 +66,6 @@ panfrost_vk_compile = executable(
   link_with : [libpanfrost_vk_compile, libpanfrost_compiler],
   c_args : [
     c_msvc_compat_args, no_override_init_args, soong_compat_c_args,
-    '-DPAN_ARCH=' + pan_vk_arch.to_string(),
   ],
   link_args : [ld_args_build_id],
   dependencies : [idep_vtn, idep_nir, idep_mesautil, libpanfrost_dep],

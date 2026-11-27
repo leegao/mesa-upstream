@@ -54,14 +54,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef PAN_ARCH
-#define PAN_ARCH 11
-#endif
-
-#if PAN_ARCH < 9 || PAN_ARCH > 15
-#error "panfrost_vk_compile only supports PAN_ARCH in the range 9..15"
-#endif
-
 /* SPIR-V header word holding the version (major/minor in the low 16 bits). */
 #define SPIRV_VERSION_WORD 1
 #define SPIRV_VERSION_1_3 0x00010300u
@@ -658,7 +650,6 @@ valhall_pack_buf_idx(nir_builder *b, nir_instr *instr, UNUSED void *data)
 
 /* --- panvk_lower_non_uniform (from panvk_vX_shader.c) ------------------- */
 
-#if PAN_ARCH >= 10
 static bool
 mark_all_access_non_uniform(UNUSED nir_builder *b, nir_instr *instr,
                             UNUSED void *data)
@@ -696,10 +687,9 @@ mark_all_access_non_uniform(UNUSED nir_builder *b, nir_instr *instr,
       return false;
    }
 }
-#endif
 
 static bool
-standalone_can_merge_workgroups(nir_shader *nir)
+standalone_can_merge_workgroups(nir_shader *nir, unsigned arch)
 {
    if (!mesa_shader_stage_uses_workgroup(nir->info.stage))
       return false;
@@ -707,7 +697,7 @@ standalone_can_merge_workgroups(nir_shader *nir)
    bool allow_merging_workgroups = valhall_can_merge_workgroups(nir);
    if (allow_merging_workgroups) {
       nir->options = pan_get_nir_shader_compiler_options(
-         PAN_ARCH, MESA_SHADER_COMPUTE, true);
+         arch, MESA_SHADER_COMPUTE, true);
       nir_foreach_function_impl(impl, nir)
          nir_progress(true, impl, ~nir_metadata_divergence);
    }
@@ -715,16 +705,16 @@ standalone_can_merge_workgroups(nir_shader *nir)
 }
 
 static void
-standalone_lower_non_uniform(nir_shader *nir, bool allow_merging_workgroups)
+standalone_lower_non_uniform(nir_shader *nir, unsigned arch,
+                             bool allow_merging_workgroups)
 {
-#if PAN_ARCH >= 10
-   if (allow_merging_workgroups)
+
+   if (arch >= 10 && allow_merging_workgroups)
       NIR_PASS(_, nir, nir_shader_instructions_pass,
                mark_all_access_non_uniform,
                nir_metadata_control_flow | nir_metadata_live_defs |
                   nir_metadata_instr_index,
                NULL);
-#endif
 
    enum nir_lower_non_uniform_access_type types =
       nir_lower_non_uniform_ubo_access |
@@ -752,6 +742,8 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, UNUSED void *data)
 {
    if (instr->type != nir_instr_type_intrinsic)
       return false;
+
+   unsigned arch = *(const unsigned *)data;
 
    nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
    unsigned bit_size = intr->def.bit_size;
@@ -792,7 +784,7 @@ panvk_lower_sysvals(nir_builder *b, nir_instr *instr, UNUSED void *data)
       val = nir_extract_u8_imm(b, nir_u2u32(b, val), 0);
       break;
    case nir_intrinsic_load_draw_id:
-      if (PAN_ARCH >= 10)
+      if (arch >= 10)
          return false;
       assert(b->shader->info.stage == MESA_SHADER_VERTEX);
       val = nir_imm_int(b, 0);
@@ -983,9 +975,9 @@ stage_name(mesa_shader_stage stage)
 }
 
 static void
-write_info_json(const char *path, mesa_shader_stage stage, const char *entry,
-                bool use_kraid, bool idvs, bool robust, bool merge_wg,
-                uint32_t core_max_id, size_t code_size,
+write_info_json(const char *path, unsigned arch, mesa_shader_stage stage,
+                const char *entry, bool use_kraid, bool idvs, bool robust,
+                bool merge_wg, uint32_t core_max_id, size_t code_size,
                 const struct pan_shader_info *info,
                 const struct standalone_fau_info *fau,
                 const struct synth_desc_ctx *desc_ctx)
@@ -998,7 +990,7 @@ write_info_json(const char *path, mesa_shader_stage stage, const char *entry,
    }
 
    fprintf(f, "{\n");
-   fprintf(f, "  \"arch\": %d,\n", PAN_ARCH);
+   fprintf(f, "  \"arch\": %d,\n", arch);
    fprintf(f, "  \"stage\": \"%s\",\n", stage_name(stage));
    fprintf(f, "  \"entry\": \"%s\",\n", entry);
    fprintf(f, "  \"backend\": \"%s\",\n", use_kraid ? "kraid" : "bifrost");
@@ -1268,6 +1260,7 @@ panfrost_vk_compile(const struct panfrost_vk_compile_options *opts)
 {
    const char *in_path = opts->in_path;
    const char *out_path = opts->out_path;
+   unsigned arch = opts->arch;
    const char *entry_override = opts->entry_override;
    const char *info_json_path = opts->info_json_path;
    int stage_override = opts->stage_override;
@@ -1311,14 +1304,14 @@ panfrost_vk_compile(const struct panfrost_vk_compile_options *opts)
    glsl_type_singleton_init_or_ref();
 
    struct spirv_capabilities spirv_caps =
-         get_spirv_capabilities(PAN_ARCH,
+         get_spirv_capabilities(arch,
                                 /* can_query_timestamp = */ true,
                                 /* timestamp_device_coherent = */ true);
 
    struct spirv_to_nir_options sopts = {
       .environment = NIR_SPIRV_VULKAN,
       .capabilities = &spirv_caps,
-      .group_non_uniform_subgroup_size = 16, // pan_subgroup_size(PAN_ARCH) is fixed to 16
+      .group_non_uniform_subgroup_size = pan_subgroup_size(arch),
       .ubo_addr_format = nir_address_format_vec2_index_32bit_offset,
       .ssbo_addr_format = nir_address_format_vec2_index_32bit_offset,
       .phys_ssbo_addr_format = nir_address_format_64bit_global,
@@ -1329,7 +1322,7 @@ panfrost_vk_compile(const struct panfrost_vk_compile_options *opts)
    };
 
    const nir_shader_compiler_options *nopts =
-      pan_get_nir_shader_compiler_options(PAN_ARCH, stage, false);
+      pan_get_nir_shader_compiler_options(arch, stage, false);
 
    nir_shader *nir =
       spirv_to_nir(words, spirv_size / 4, NULL, stage, entry, &sopts, nopts);
@@ -1347,7 +1340,7 @@ panfrost_vk_compile(const struct panfrost_vk_compile_options *opts)
    nir_remove_non_entrypoints(nir);
 
    /* --- panvk_preprocess_nir (v9+ specialization) ---------------------- */
-   if (pan_use_kraid(PAN_ARCH, stage, false))
+   if (pan_use_kraid(arch, stage, false))
       NIR_PASS(_, nir, nir_lower_mediump_vars,
                nir_var_shader_temp | nir_var_function_temp);
 
@@ -1376,13 +1369,13 @@ panfrost_vk_compile(const struct panfrost_vk_compile_options *opts)
    NIR_PASS(_, nir, nir_inline_sysval,
             nir_intrinsic_load_core_max_id_arm, core_max_id);
 
-   pan_preprocess_nir(nir, PAN_ARCH);
+   pan_preprocess_nir(nir, arch);
 
    /* --- panvk_lower_nir (v9+ specialization) --------------------------- */
    NIR_PASS(_, nir, nir_opt_large_constants, NULL, 32);
 
    NIR_PASS(_, nir, panvk_nir_lower_cooperative_matrix,
-            pan_subgroup_size(PAN_ARCH));
+            pan_subgroup_size(arch));
 
    const nir_opt_access_options access_options = {
       .is_vulkan = true,
@@ -1470,31 +1463,31 @@ panfrost_vk_compile(const struct panfrost_vk_compile_options *opts)
 
    /* --- panvk_compile_nir ---------------------------------------------- */
    struct pan_compile_inputs inputs = {
-      .arch = PAN_ARCH,
+      .arch = arch,
       .model = NULL,
       .no_idvs = no_idvs,
       .robust_modes =
          robust ? (nir_var_mem_ubo | nir_var_mem_ssbo) : 0,
-      .robust_descriptors = PAN_ARCH >= 10,
+      .robust_descriptors = arch >= 10,
       .fau = { .reserved = 0, .promote_immediates = promote_imm },
    };
 
    struct pan_varying_layout vlayout = {0};
    if (stage == MESA_SHADER_VERTEX) {
-      pan_varying_collect_formats(&vlayout, nir, PAN_ARCH, false);
-      pan_build_varying_layout_compact(&vlayout, nir, PAN_ARCH);
+      pan_varying_collect_formats(&vlayout, nir, arch, false);
+      pan_build_varying_layout_compact(&vlayout, nir, arch);
       inputs.varying_layout = &vlayout;
    }
 
-   bool allow_merging_workgroups = standalone_can_merge_workgroups(nir);
-   standalone_lower_non_uniform(nir, allow_merging_workgroups);
+   bool allow_merging_workgroups = standalone_can_merge_workgroups(nir, arch);
+   standalone_lower_non_uniform(nir, arch, allow_merging_workgroups);
 
    struct pan_shader_info info = {0};
    pan_postprocess_nir(nir, &inputs, &info);
 
    struct standalone_fau_info fau = {0};
    NIR_PASS(_, nir, nir_shader_instructions_pass, panvk_lower_sysvals,
-            nir_metadata_control_flow, NULL);
+            nir_metadata_control_flow, &arch);
    lower_load_push_consts(nir, &fau);
 
    inputs.fau.reserved = fau.total_count * 2;
@@ -1508,7 +1501,7 @@ panfrost_vk_compile(const struct panfrost_vk_compile_options *opts)
    pan_shader_compile(nir, &inputs, &binary, &info);
 
    if (disasm) {
-      pan_disassemble_bi(stderr, binary.data, binary.size, PAN_ARCH,
+      pan_disassemble_bi(stderr, binary.data, binary.size, arch,
                            /* verbose = */ true);
       fprintf(stderr, "\n");
    }
@@ -1526,9 +1519,9 @@ panfrost_vk_compile(const struct panfrost_vk_compile_options *opts)
    fwrite(binary.data, 1, binary.size, out);
    fclose(out);
 
-   bool used_kraid = pan_use_kraid(PAN_ARCH, stage, false);
+   bool used_kraid = pan_use_kraid(arch, stage, false);
    if (info_json_path) {
-      write_info_json(info_json_path, stage, entry, used_kraid, !no_idvs,
+      write_info_json(info_json_path, arch, stage, entry, used_kraid, !no_idvs,
                       robust, allow_merging_workgroups, core_max_id,
                       binary.size, &info, &fau, &desc_ctx);
    }
@@ -1544,98 +1537,4 @@ panfrost_vk_compile(const struct panfrost_vk_compile_options *opts)
    ralloc_free(nir);
    glsl_type_singleton_decref();
    return 0;
-}
-
-static void
-print_usage(const char *prog, FILE *stream)
-{
-   fprintf(
-      stream,
-      "Usage: %s [options] <input.spv> <output.bin>\n"
-      "  (built for Valhall arch v%d)\n\n"
-      "Options:\n"
-      "  --kraid               Force Rust Kraid backend (PAN_USE_KRAID=all)\n"
-      "  --no-kraid            Force C Bifrost/Valhall backend (PAN_USE_KRAID=0)\n"
-      "  --robust              Enable SSBO/descriptor robustness bounds checks\n"
-      "  --no-idvs             Disable IDVS for vertex shaders\n"
-      "  --entry <name>        Override SPIR-V entry point name\n"
-      "  --stage <vert|frag|comp>  Override detected shader stage\n"
-      "  --core-max-id <N>     Set load_core_max_id_arm sysval (default: 0)\n"
-      "  --no-promote-imm      Disable FAU immediate promotion\n"
-      "  --no-clamp-version    Do not clamp SPIR-V >= 1.4 header to 1.3\n"
-      "  --dump-nir            Print final lowered NIR to stderr\n"
-      "  --disasm              Disassemble emitted Valhall ISA to stderr\n"
-      "  --info-json <file>    Write FAU, descriptor, and shader stats JSON\n"
-      "  -h, --help            Show this help message\n",
-      prog, PAN_ARCH);
-}
-
-int
-main(int argc, char **argv)
-{
-   struct panfrost_vk_compile_options opts = {
-      .stage_override = -1,
-      .robust = getenv("PANVK_ROBUST") && atoi(getenv("PANVK_ROBUST")) != 0,
-      .promote_imm = true,
-      .clamp_version = true,
-   };
-
-   for (int i = 1; i < argc; i++) {
-      if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-         print_usage(argv[0], stdout);
-         return 0;
-      } else if (strcmp(argv[i], "--robust") == 0) {
-         opts.robust = true;
-      } else if (strcmp(argv[i], "--no-idvs") == 0) {
-         opts.no_idvs = true;
-      } else if (strcmp(argv[i], "--kraid") == 0) {
-         setenv("PAN_USE_KRAID", "all", 1);
-      } else if (strcmp(argv[i], "--no-kraid") == 0) {
-         setenv("PAN_USE_KRAID", "0", 1);
-      } else if (strcmp(argv[i], "--no-promote-imm") == 0) {
-         opts.promote_imm = false;
-      } else if (strcmp(argv[i], "--no-clamp-version") == 0) {
-         opts.clamp_version = false;
-      } else if (strcmp(argv[i], "--dump-nir") == 0) {
-         opts.dump_nir = true;
-      } else if (strcmp(argv[i], "--disasm") == 0) {
-         opts.disasm = true;
-      } else if (strcmp(argv[i], "--entry") == 0 && i + 1 < argc) {
-         opts.entry_override = argv[++i];
-      } else if (strcmp(argv[i], "--info-json") == 0 && i + 1 < argc) {
-         opts.info_json_path = argv[++i];
-      } else if (strcmp(argv[i], "--core-max-id") == 0 && i + 1 < argc) {
-         opts.core_max_id = (uint32_t)strtoul(argv[++i], NULL, 0);
-      } else if (strcmp(argv[i], "--stage") == 0 && i + 1 < argc) {
-         const char *s = argv[++i];
-         if (strcmp(s, "vert") == 0 || strcmp(s, "vertex") == 0) {
-            opts.stage_override = MESA_SHADER_VERTEX;
-         } else if (strcmp(s, "frag") == 0 || strcmp(s, "fragment") == 0) {
-            opts.stage_override = MESA_SHADER_FRAGMENT;
-         } else if (strcmp(s, "comp") == 0 || strcmp(s, "compute") == 0) {
-            opts.stage_override = MESA_SHADER_COMPUTE;
-         } else {
-            fprintf(stderr, "panfrost_vk_compile: unknown stage '%s'\n", s);
-            return 1;
-         }
-      } else if (argv[i][0] == '-') {
-         fprintf(stderr, "panfrost_vk_compile: unknown option '%s'\n", argv[i]);
-         return 1;
-      } else if (!opts.in_path) {
-         opts.in_path = argv[i];
-      } else if (!opts.out_path) {
-         opts.out_path = argv[i];
-      } else {
-         fprintf(stderr, "panfrost_vk_compile: unexpected argument %s\n",
-                 argv[i]);
-         return 1;
-      }
-   }
-
-   if (!opts.in_path || !opts.out_path) {
-      print_usage(argv[0], stderr);
-      return 1;
-   }
-
-   return panfrost_vk_compile(&opts);
 }

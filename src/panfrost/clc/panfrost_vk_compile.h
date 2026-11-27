@@ -19,6 +19,7 @@ struct panfrost_vk_compile_options {
    /* Required: input SPIR-V module path and output ISA binary path. */
    const char *in_path;
    const char *out_path;
+   unsigned arch;
 
    /* Entry point name override, or NULL to use the name found in the module. */
    const char *entry_override;
