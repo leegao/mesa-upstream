@@ -26,6 +26,11 @@ on:
 permissions:
   contents: write
 
+env:
+  # Pinned airgapped bundle (debs + wheels + bindgen) produced by
+  # panfrost-vk-predownloaded.yml. Update the tag when regenerating the bundle.
+  PREDOWNLOADED_BUNDLE_URL: https://github.com/leegao/mesa-upstream/releases/download/bookworm-bundle-20261127-b48ae2e-1795752866/predownloaded-bookworm.tar.xz
+
 jobs:
   build:
     name: Build panfrost_vk_compile (${{ matrix.variant }}, debian:bookworm)
@@ -56,7 +61,7 @@ jobs:
         apt-get install -y --no-install-recommends \
           build-essential pkg-config bison flex libdrm-dev libelf-dev \
           python3 python3-pip python3-venv \
-          spirv-tools spirv-headers glslang-tools
+          spirv-headers glslang-tools xz-utils
         # bookworm only ships LLVM 14; the CLC path needs LLVM >= 15.
         curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
           | gpg --dearmor -o /usr/share/keyrings/llvm.gpg
@@ -82,21 +87,18 @@ jobs:
         cargo install bindgen-cli --version 0.71.1 --locked
         bindgen --version
 
-    - name: Build SPIRV-Tools 2024.1 (bookworm ships 2023.1)
+    - name: Fetch prebuilt SPIRV-Tools 2024.1 from bundle
       run: |
-        apt-get install -y --no-install-recommends cmake ninja-build
-        # The v2024.1 tree ref is not a branch; pin the exact commit and let
-        # SPIRV-Tools' git-sync-deps fetch the matching SPIRV-Headers.
-        git clone --filter=blob:none \
-          https://github.com/KhronosGroup/SPIRV-Tools /tmp/SPIRV-Tools
-        git -C /tmp/SPIRV-Tools checkout 04896c462d9f3f504c99a4698605b6524af813c1
-        ( cd /tmp/SPIRV-Tools && python3 utils/git-sync-deps )
-        cmake -S /tmp/SPIRV-Tools -B /tmp/spirv-build -G Ninja \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DSPIRV_BUILD_FUZZER=OFF -DSPIRV_SKIP_TESTS=ON \
-          -DCMAKE_INSTALL_PREFIX=/usr
-        cmake --build /tmp/spirv-build --parallel "$(nproc)"
-        cmake --install /tmp/spirv-build
+        # bookworm ships SPIRV-Tools 2023.1; Mesa's CLC path needs >= 2024.1.
+        # Instead of rebuilding from source (a major bottleneck), grab the
+        # prebuilt .deb from the airgapped bundle produced by
+        # panfrost-vk-predownloaded.yml (via predownloaded/build-spirv-tools.sh).
+        curl -fsSL "$PREDOWNLOADED_BUNDLE_URL" -o /tmp/predownloaded-bookworm.tar.xz
+        tar -xf /tmp/predownloaded-bookworm.tar.xz -C /tmp
+        # The bundle's debs/spirv-tools-2024_2024.1_amd64.deb is a standalone
+        # SPIRV-Tools (no LLVM dep). bookworm's 2023.1 is not installed above,
+        # so there are no file conflicts.
+        dpkg -i /tmp/debs/spirv-tools-2024_2024.1_amd64.deb
         pkg-config --modversion SPIRV-Tools
 
     - name: Configure
