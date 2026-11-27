@@ -37,7 +37,7 @@ endif
 # different generation, change pan_vk_arch below.
 pan_vk_arch = 11
 
-panfrost_vk_compile = executable(
+libpanfrost_vk_compile = static_library(
   'panfrost_vk_compile',
   [
     'panfrost_vk_compile.c',
@@ -49,7 +49,22 @@ panfrost_vk_compile = executable(
     inc_panfrost,
     include_directories('../vulkan'),
   ],
-  link_with : [libpanfrost_compiler],
+  c_args : [
+    c_msvc_compat_args, no_override_init_args, soong_compat_c_args,
+    '-DPAN_ARCH=' + pan_vk_arch.to_string(),
+  ],
+  dependencies : [idep_vtn, idep_nir, idep_mesautil, libpanfrost_dep],
+)
+
+panfrost_vk_compile = executable(
+  'panfrost_vk_compile',
+  ['panfrost_vk_compile.c'],
+  include_directories : [
+    inc_include,
+    inc_src,
+    inc_panfrost,
+  ],
+  link_with : [libpanfrost_vk_compile, libpanfrost_compiler],
   c_args : [
     c_msvc_compat_args, no_override_init_args, soong_compat_c_args,
     '-DPAN_ARCH=' + pan_vk_arch.to_string(),
