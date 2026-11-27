@@ -974,11 +974,37 @@ stage_name(mesa_shader_stage stage)
    }
 }
 
+static const char *
+varying_slot_name(gl_varying_slot slot)
+{
+   switch (slot) {
+   case VARYING_SLOT_POS: return "POS";
+   case VARYING_SLOT_PSIZ: return "PSIZ";
+   case VARYING_SLOT_COL0: return "COL0";
+   case VARYING_SLOT_COL1: return "COL1";
+   case VARYING_SLOT_BFC0: return "BFC0";
+   case VARYING_SLOT_BFC1: return "BFC1";
+   case VARYING_SLOT_FOGC: return "FOGC";
+   case VARYING_SLOT_PNTC: return "PNTC";
+   case VARYING_SLOT_CLIP_DIST0: return "CLIP_DIST0";
+   case VARYING_SLOT_CLIP_DIST1: return "CLIP_DIST1";
+   case VARYING_SLOT_CULL_DIST0: return "CULL_DIST0";
+   case VARYING_SLOT_CULL_DIST1: return "CULL_DIST1";
+   case VARYING_SLOT_LAYER: return "LAYER";
+   case VARYING_SLOT_VIEWPORT: return "VIEWPORT";
+   case VARYING_SLOT_FACE: return "FACE";
+   case VARYING_SLOT_PRIMITIVE_ID: return "PRIMITIVE_ID";
+   default: return "";
+   }
+}
+
 static void
 write_info_json(const char *path, unsigned arch, mesa_shader_stage stage,
                 const char *entry, bool use_kraid, bool idvs, bool robust,
                 bool merge_wg, uint32_t core_max_id, size_t code_size,
+                const uint8_t *orig_out_ncomps,
                 const struct pan_shader_info *info,
+                const struct pan_varying_layout *vlayout,
                 const struct standalone_fau_info *fau,
                 const struct synth_desc_ctx *desc_ctx)
 {
@@ -1003,6 +1029,12 @@ write_info_json(const char *path, unsigned arch, mesa_shader_stage stage,
    fprintf(f, "  \"work_reg_count\": %u,\n", info->work_reg_count);
    fprintf(f, "  \"tls_size\": %u,\n", info->tls_size);
    fprintf(f, "  \"wls_size\": %u,\n", info->wls_size);
+   fprintf(f, "  \"constant_data_size\": %u,\n", info->stats.valhall.constant_data_size);
+   if (stage == MESA_SHADER_VERTEX) {
+      fprintf(f, "  \"secondary_enable\": %s,\n",
+              info->vs.secondary_enable ? "true" : "false");
+      fprintf(f, "  \"secondary_offset\": %u,\n", info->vs.secondary_offset);
+   }
 
    fprintf(f, "  \"fau\": {\n");
    fprintf(f, "    \"sysval_slots\": %u,\n", fau->sysval_count);
@@ -1061,6 +1093,37 @@ write_info_json(const char *path, unsigned arch, mesa_shader_stage stage,
             bi->desc_idx, bi->desc_count);
          first = false;
       }
+   }
+   fprintf(f, "\n  ],\n");
+
+   /* Emit varying slot layout (Vertex outputs from vlayout, Fragment inputs from info->varyings.formats). */
+   const struct pan_varying_layout *vl =
+      (stage == MESA_SHADER_VERTEX && vlayout && vlayout->count > 0)
+         ? vlayout
+         : &info->varyings.formats;
+   fprintf(f, "  \"varyings\": [\n");
+   first = true;
+   for (unsigned i = 0; i < vl->count; i++) {
+      const struct pan_varying_slot *vs = &vl->slots[i];
+      if (pan_varying_slot_is_empty(vs))
+         continue;
+      const char *sname = varying_slot_name(vs->location);
+      int user_loc = (vs->location >= VARYING_SLOT_VAR0)
+                        ? (int)(vs->location - VARYING_SLOT_VAR0)
+                        : -1;
+      unsigned ncomps = (unsigned)vs->ncomps;
+      if (stage == MESA_SHADER_VERTEX && orig_out_ncomps &&
+          vs->location < NUM_TOTAL_VARYING_SLOTS &&
+          orig_out_ncomps[vs->location] > 0) {
+         ncomps = orig_out_ncomps[vs->location];
+      }
+      fprintf(f,
+              "%s    {\"index\": %u, \"location\": %u, \"user_location\": %d, "
+              "\"name\": \"%s\", \"offset\": %d, \"ncomps\": %u, "
+              "\"section\": %u}",
+              first ? "" : ",\n", i, (unsigned)vs->location, user_loc, sname,
+              (int)vs->offset, ncomps, (unsigned)vs->section);
+      first = false;
    }
    fprintf(f, "\n  ]\n");
    fprintf(f, "}\n");
@@ -1199,6 +1262,14 @@ get_spirv_capabilities(unsigned arch,
 
    caps.StorageImageReadWithoutFormat = true;  /* shaderStorageImageReadWithoutFormat */
    caps.StorageImageWriteWithoutFormat = true; /* shaderStorageImageWriteWithoutFormat */
+   caps.Image1D = true;
+   caps.Sampled1D = true;
+   caps.ImageBuffer = true;
+   caps.SampledBuffer = true;
+   caps.ImageCubeArray = true;
+   caps.SampledCubeArray = true;
+   caps.ImageQuery = true;
+   caps.ImageGatherExtended = true;
 
    /* --- Vulkan 1.1 --- */
    caps.StorageBuffer16BitAccess = true;            /* storageBuffer16BitAccess */
@@ -1435,6 +1506,7 @@ panfrost_vk_compile(const struct panfrost_vk_compile_options *opts)
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
 
    /* --- panvk_lower_nir_io (VS/FS only) -------------------------------- */
+   uint8_t orig_out_ncomps[NUM_TOTAL_VARYING_SLOTS] = {0};
    if (stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_FRAGMENT) {
       nir_assign_io_var_locations(nir, nir_var_shader_in);
       nir_assign_io_var_locations(nir, nir_var_shader_out);
@@ -1474,6 +1546,33 @@ panfrost_vk_compile(const struct panfrost_vk_compile_options *opts)
 
    struct pan_varying_layout vlayout = {0};
    if (stage == MESA_SHADER_VERTEX) {
+      nir_foreach_function_impl(impl, nir) {
+         nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+               if (instr->type != nir_instr_type_intrinsic)
+                  continue;
+               nir_intrinsic_instr *intr = nir_instr_as_intrinsic(instr);
+               if (intr->intrinsic != nir_intrinsic_store_output)
+                  continue;
+               nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+               if (sem.location < NUM_TOTAL_VARYING_SLOTS) {
+                  unsigned wmask = nir_intrinsic_write_mask(intr);
+                  unsigned comp = nir_intrinsic_component(intr);
+                  unsigned nsrc = intr->src[0].ssa->num_components;
+                  unsigned def_mask = 0;
+                  for (unsigned c = 0; c < nsrc; c++) {
+                     if ((wmask & (1u << c)) &&
+                         !nir_scalar_is_undef(nir_scalar_resolved(intr->src[0].ssa, c))) {
+                        def_mask |= (1u << c);
+                     }
+                  }
+                  unsigned top = def_mask ? (comp + (unsigned)util_last_bit(def_mask)) : 0;
+                  if (top > orig_out_ncomps[sem.location])
+                     orig_out_ncomps[sem.location] = (uint8_t)top;
+               }
+            }
+         }
+      }
       pan_varying_collect_formats(&vlayout, nir, arch, false);
       pan_build_varying_layout_compact(&vlayout, nir, arch);
       inputs.varying_layout = &vlayout;
@@ -1523,7 +1622,9 @@ panfrost_vk_compile(const struct panfrost_vk_compile_options *opts)
    if (info_json_path) {
       write_info_json(info_json_path, arch, stage, entry, used_kraid, !no_idvs,
                       robust, allow_merging_workgroups, core_max_id,
-                      binary.size, &info, &fau, &desc_ctx);
+                      binary.size, orig_out_ncomps, &info,
+                      stage == MESA_SHADER_VERTEX ? &vlayout : NULL,
+                      &fau, &desc_ctx);
    }
 
    uint32_t instrs = info.stats.valhall.instrs;
