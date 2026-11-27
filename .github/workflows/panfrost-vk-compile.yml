@@ -91,7 +91,7 @@ jobs:
 
     - name: Build panfrost_vk_compile
       run: |
-        ninja -C build-panfrost-vk src/panfrost/clc/panfrost_vk_compile
+        ninja -C build-panfrost-vk src/panfrost/clc/panfrost_vk_compile -v
 
     - name: Smoke test
       run: |
