@@ -157,7 +157,7 @@ jobs:
       id: rel
       run: |
         DATE="$(date -u +%Y%m%d)"
-        COMMIT="$(git rev-parse --short HEAD)"
+        COMMIT="$(echo "$GITHUB_SHA" | cut -c1-7)"
         EPOCH="$(date -u +%s)"
         TAG="panfrost-vk-compile-bookworm-${DATE}-${COMMIT}-${EPOCH}"
         ASSET="panfrost_vk_compile-bookworm-${TAG}"
