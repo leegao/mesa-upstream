@@ -156,7 +156,18 @@ jobs:
       run: |
         mkdir -p stage
         cp build/src/panfrost/clc/panfrost_vk_compile stage/
-        cp build/src/panfrost/clc/libpanfrost_vk_compile.a stage/
+        ARCHIVES=$(for token in $(ninja -C build -t commands src/panfrost/clc/panfrost_vk_compile | tail -n 1); do
+          case "$token" in
+            /*) ;;
+            *.a) echo "build/$token" ;;
+          esac
+        done)
+        ld -r --gc-sections -e panfrost_vk_compile -o stage/panfrost_vk_compile.o \
+          --start-group $ARCHIVES --end-group
+        objcopy --keep-global-symbol=panfrost_vk_compile stage/panfrost_vk_compile.o
+        strip --strip-unneeded stage/panfrost_vk_compile.o
+        ar rcs stage/libpanfrost_vk_compile.a stage/panfrost_vk_compile.o
+        rm -f stage/panfrost_vk_compile.o
         cp src/panfrost/clc/panfrost_vk_compile.h stage/
         ls -l stage
 
