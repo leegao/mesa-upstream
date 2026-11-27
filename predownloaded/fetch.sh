@@ -97,6 +97,31 @@ else
   chmod +x "$BIN"/bindgen 2>/dev/null || true
 fi
 
+# --- Fetch rustc (for the rust-kraid variant) --------------------------------
+# bookworm ships rustc 1.63; Mesa requires >= 1.85. Package a standalone,
+# relocatable rustc + cargo toolchain into bin/ so the airgapped sandbox (and
+# CI) can use it without rustup.  The official dist tarball installs via its
+# own install.sh with --prefix, producing a relocatable toolchain.
+RUSTC_VERSION=1.85.1
+echo "==> Fetching rustc $RUSTC_VERSION (standalone, relocatable)"
+RUSTC_DIST="https://static.rust-lang.org/dist/rust-${RUSTC_VERSION}-x86_64-unknown-linux-gnu.tar.xz"
+if curl -fsSL "$RUSTC_DIST" -o /tmp/rustc-dist.tar.xz; then
+  rm -rf /tmp/rustc-dist /tmp/rustc-stage
+  mkdir -p /tmp/rustc-dist /tmp/rustc-stage
+  tar -xf /tmp/rustc-dist.tar.xz -C /tmp/rustc-dist --strip-components=1
+  ( cd /tmp/rustc-dist && \
+    ./install.sh --prefix=/tmp/rustc-stage \
+      --components=rustc,cargo,rust-std-x86_64-unknown-linux-gnu \
+      --disable-ldconfig )
+  tar -I 'xz -9 -T4' -cf "$BIN/rustc-${RUSTC_VERSION}-x86_64.tar.xz" \
+    -C /tmp/rustc-stage .
+  echo "==> Wrote $BIN/rustc-${RUSTC_VERSION}-x86_64.tar.xz"
+else
+  # rustc is only needed for the rust-kraid variant; do not fail the whole
+  # fetch if it is unavailable (the default non-rust build does not need it).
+  echo "WARNING: could not fetch rustc; rust-kraid variant will need rustup." >&2
+fi
+
 echo
 echo "==> Done. Contents:"
 du -sh "$DEBS" "$WHEELS" "$BIN" 2>/dev/null || true

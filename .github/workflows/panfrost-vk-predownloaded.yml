@@ -42,13 +42,32 @@ jobs:
         # self-contained airgapped bundle.
         # tar -czf predownloaded-bookworm.tar.gz \
         #   -C predownloaded debs wheels bin README.md install.sh
-        tar -I 'xz -9 -T4 -v' -cf predownloaded-bookworm.tar.xz -C predownloaded debs wheels bin README.md install.sh
+        tar -I 'xz -9 -T4 -v' -cf predownloaded-bookworm.tar.xz -C predownloaded debs wheels bin README.md install.sh sample_shaders.tar.xz
+
+    - name: Split out spirv-tools
+      run: |
+        # Also publish a small spirv-tools-only tarball so CI can grab just the
+        # prebuilt SPIRV-Tools without downloading the whole bundle.
+        tar -I 'xz -9 -T4' -cf spirv-tools.tar.xz \
+          -C predownloaded/debs spirv-tools-2024_2024.1_amd64.deb
+        ls -l spirv-tools.tar.xz
+
+    - name: Split out rustc-bindgen
+      run: |
+        # Also publish a small rustc + bindgen tarball so CI can grab the Rust
+        # toolchain without downloading the whole bundle.
+        tar -I 'xz -9 -T4' -cf rustc-bindgen.tar.xz \
+          -C predownloaded/bin rustc-1.85.1-x86_64.tar.xz bindgen
+        ls -l rustc-bindgen.tar.xz
 
     - name: Upload bundle
       uses: actions/upload-artifact@v4
       with:
         name: predownloaded-bookworm
-        path: predownloaded-bookworm.tar.xz
+        path: |
+          predownloaded-bookworm.tar.xz
+          spirv-tools.tar.xz
+          rustc-bindgen.tar.xz
         retention-days: 5
 
     # Publish a GitHub release on every push to this branch. The Linux epoch in
@@ -72,7 +91,10 @@ jobs:
         tag_name: ${{ steps.rel.outputs.tag }}
         name: Bookworm bundle ${{ steps.rel.outputs.date }} (${{ steps.rel.outputs.commit }})
         body: Automated predownloaded bookworm bundle for ${{ steps.rel.outputs.commit }}.
-        files: predownloaded-bookworm.tar.xz
+        files: |
+          predownloaded-bookworm.tar.xz
+          spirv-tools.tar.xz
+          rustc-bindgen.tar.xz
         fail_on_unmatched_files: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
