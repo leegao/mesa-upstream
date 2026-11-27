@@ -38,6 +38,7 @@ _kraid_bindings_rs = rust.bindgen(
   output_inline_wrapper : 'kraid_bindings.c',
   c_args : [
     pre_args,
+    sse41_args, # in Github, bindgen doesn't dynamically link libclang.so
   ],
   args : [
     bindgen_output_args,
