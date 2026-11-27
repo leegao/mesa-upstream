@@ -1434,6 +1434,8 @@ main(int argc, char **argv)
       NIR_PASS(_, nir, nir_lower_var_copies);
       NIR_PASS(_, nir, nir_lower_indirect_derefs_to_if_else_trees,
                nir_var_shader_in | nir_var_shader_out, UINT32_MAX);
+      NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries,
+               nir_shader_get_entrypoint(nir), nir_var_shader_out);
       NIR_PASS(_, nir, nir_lower_io,
                nir_var_shader_in | nir_var_shader_out, glsl_type_size,
                stage == MESA_SHADER_FRAGMENT

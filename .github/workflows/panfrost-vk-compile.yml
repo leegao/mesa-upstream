@@ -72,7 +72,7 @@ jobs:
       if: matrix.panfrost_rust
       run: |
         # Mesa requires bindgen >= 0.71.1; 0.72.0 and 0.73.x are known-buggy.
-        cargo install bindgen-cli --version 0.71.1 --locked
+        cargo install bindgen-cli --version 0.72.1 --locked
 
     - name: Configure
       env:
