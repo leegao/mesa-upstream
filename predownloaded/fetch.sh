@@ -62,11 +62,15 @@ cp -f /var/cache/apt/archives/*.deb "$DEBS"/ 2>/dev/null || true
 # Also pick up anything downloaded into the cwd by the fallback path.
 mv -f ./*.deb "$DEBS"/ 2>/dev/null || true
 
-# --- Build SPIRV-Tools >= 2024.1 (bookworm ships 2023.1) -------------------
-# Mesa 27's CLC path requires SPIRV-Tools >= 2024.1; build it from source and
-# drop the .deb into debs/.  Non-fatal: the build will fail at configure if it
-# is missing, but the rest of the bundle is still produced.
-if [ -x "$ROOT/build-spirv-tools.sh" ]; then
+# --- SPIRV-Tools >= 2024.1 (bookworm ships 2023.1) -------------------------
+# Mesa 27's CLC path requires SPIRV-Tools >= 2024.1.  SHORTCUT for testing:
+# if a prebuilt spirv-tools.tar.xz is committed alongside this script, reuse it
+# instead of rebuilding from source (saves ~9m).  Otherwise build from source.
+if [ -f "$ROOT/spirv-tools.tar.xz" ]; then
+  echo "==> Reusing prebuilt SPIRV-Tools from $ROOT/spirv-tools.tar.xz"
+  tar -xf "$ROOT/spirv-tools.tar.xz" -C "$ROOT"
+elif [ -x "$ROOT/build-spirv-tools.sh" ]; then
+  echo "==> Building SPIRV-Tools from source (no prebuilt tarball found)"
   "$ROOT/build-spirv-tools.sh" || \
     echo "WARNING: SPIRV-Tools build failed; the CLC build will need it." >&2
 fi
@@ -80,9 +84,10 @@ python3 -m pip download --dest "$WHEELS" \
 echo "==> Fetching bindgen $BINDGEN_VERSION (prebuilt)"
 ok=0
 for target in x86_64-unknown-linux-gnu x86_64-unknown-linux-musl; do
-  url="https://github.com/rust-lang/rust-bindgen/releases/download/v${BINDGEN_VERSION}/bindgen-${BINDGEN_VERSION}-${target}.tar.gz"
-  if curl -fsSL "$url" -o /tmp/bindgen.tar.gz; then
-    tar -xzf /tmp/bindgen.tar.gz -C /tmp
+  # bindgen publishes `bindgen-cli-<target>.tar.xz` (not `bindgen-<ver>-...`).
+  url="https://github.com/rust-lang/rust-bindgen/releases/download/v${BINDGEN_VERSION}/bindgen-cli-${target}.tar.xz"
+  if curl -fsSL "$url" -o /tmp/bindgen.tar.xz; then
+    tar -xJf /tmp/bindgen.tar.xz -C /tmp
     # The archive contains a single `bindgen` binary at its root.
     find /tmp -maxdepth 2 -name bindgen -type f -exec cp -f {} "$BIN"/ \;
     ok=1
