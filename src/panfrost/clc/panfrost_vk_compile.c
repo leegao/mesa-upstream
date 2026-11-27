@@ -33,6 +33,7 @@
 #include "compiler/glsl_types.h"
 #include "compiler/spirv/nir_spirv.h"
 #include "compiler/spirv/spirv.h"
+#include "compiler/spirv/spirv_info.h"
 #include "nir.h"
 #include "nir_builder.h"
 #include "nir_builder_opcodes.h"
@@ -1174,6 +1175,93 @@ read_spirv(const char *path, size_t *size_out)
    return words;
 }
 
+/* Mirrors vk_physical_device_get_spirv_capabilities() (generated from
+ * vk.xml) for the subset of caps panvk's get_physical_device_features()
+ * actually enables, selected by PAN_ARCH.  No panvk/libvulkan dependency.
+ *
+ * Device-dependent caps (shader clock) are taken as parameters because the
+ * standalone tool has no real device to query; pass the same values panvk
+ * would derive from kmod props (gpu_can_query_timestamp /
+ * timestamp_device_coherent).
+ */
+static struct spirv_capabilities
+get_spirv_capabilities(unsigned arch,
+                       bool can_query_timestamp,
+                       bool timestamp_device_coherent)
+{
+   struct spirv_capabilities caps = { false, };
+
+   /* --- Vulkan 1.0 core features (panvk: all true except noted) --- */
+   caps.Int16 = true;   /* shaderInt16 = true */
+   caps.Int64 = true;   /* shaderInt64 = true */
+   caps.Float64 = false;/* shaderFloat64 = false (all archs) */
+   caps.Int8 = true;    /* shaderInt8 = true (VK12 / KHR_shader_float16_int8) */
+
+   /* shaderFloat16 = PAN_ARCH >= 10 */
+   caps.Float16 = arch >= 10;
+
+   /* shaderStorageImageMultisample = false -> no MS storage/array caps */
+   /* (there is no StorageImageMS enumerant; MS is gated via ImageMSArray) */
+   caps.ImageMSArray = false; /* shaderStorageImageMultisample = false */
+
+   caps.StorageImageReadWithoutFormat = true;  /* shaderStorageImageReadWithoutFormat */
+   caps.StorageImageWriteWithoutFormat = true; /* shaderStorageImageWriteWithoutFormat */
+
+   /* --- Vulkan 1.1 --- */
+   caps.StorageBuffer16BitAccess = true;            /* storageBuffer16BitAccess */
+   caps.UniformAndStorageBuffer16BitAccess = true;  /* uniformAndStorageBuffer16BitAccess */
+   caps.StoragePushConstant16 = true;               /* storagePushConstant16 */
+   caps.StorageInputOutput16 = true;                /* storageInputOutput16 */
+   caps.VariablePointers = true;                    /* variablePointers */
+   caps.VariablePointersStorageBuffer = true;       /* variablePointersStorageBuffer */
+
+   /* --- Vulkan 1.2 / KHR_8bit_storage --- */
+   caps.StorageBuffer8BitAccess = true;             /* storageBuffer8BitAccess */
+   caps.UniformAndStorageBuffer8BitAccess = true;   /* uniformAndStorageBuffer8BitAccess */
+   caps.StoragePushConstant8 = true;                /* storagePushConstant8 */
+
+   /* descriptorIndexing = PAN_ARCH >= 9; non-uniform indexing features all
+    * true.  The non-uniform cap is ShaderNonUniform; dynamic indexing is
+    * implied by the per-class *ArrayDynamicIndexing caps (all true here). */
+   caps.ShaderNonUniform = arch >= 9;               /* descriptorIndexing */
+   caps.RuntimeDescriptorArray = true;              /* runtimeDescriptorArray */
+
+   /* bufferDeviceAddress = true */
+   caps.PhysicalStorageBufferAddresses = true;
+
+   /* vulkanMemoryModel + DeviceScope = true */
+   caps.VulkanMemoryModel = true;
+   caps.VulkanMemoryModelDeviceScope = true;
+
+   /* --- Vulkan 1.3 --- */
+   caps.DemoteToHelperInvocation = true;            /* shaderDemoteToHelperInvocation */
+
+   /* --- VK_KHR_shader_clock (device-dependent) --- */
+   caps.ShaderClockKHR = can_query_timestamp;       /* KHR_shader_clock ext */
+
+   /* --- Subgroup ops (from subgroupSupportedOperations property) ---
+    * panvk sets BASIC|VOTE|ARITHMETIC|BALLOT|SHUFFLE|SHUFFLE_RELATIVE|
+    * CLUSTERED|QUAD|ROTATE|ROTATE_CLUSTERED for all archs.
+    */
+   caps.GroupNonUniform = true;                     /* BASIC_BIT */
+   caps.GroupNonUniformVote = true;                 /* VOTE_BIT */
+   caps.GroupNonUniformArithmetic = true;           /* ARITHMETIC_BIT */
+   caps.GroupNonUniformBallot = true;               /* BALLOT_BIT */
+   caps.GroupNonUniformShuffle = true;              /* SHUFFLE_BIT */
+   caps.GroupNonUniformShuffleRelative = true;      /* SHUFFLE_RELATIVE_BIT */
+   caps.GroupNonUniformClustered = true;            /* CLUSTERED_BIT */
+   caps.GroupNonUniformQuad = true;                 /* QUAD_BIT */
+
+   /* --- VK_KHR_cooperative_matrix: PAN_ARCH >= 11 --- */
+   caps.CooperativeMatrixKHR = arch >= 11;
+
+   /* --- VK_KHR_shader_integer_dot_product: shaderIntegerDotProduct = true --- */
+   caps.DotProductKHR = true;
+
+   (void)timestamp_device_coherent; /* only affects shaderDeviceClock, not a cap */
+   return caps;
+}
+
 static void
 print_usage(const char *prog, FILE *stream)
 {
@@ -1301,9 +1389,15 @@ main(int argc, char **argv)
 
    glsl_type_singleton_init_or_ref();
 
+   struct spirv_capabilities spirv_caps =
+         get_spirv_capabilities(PAN_ARCH,
+                                /* can_query_timestamp = */ true,
+                                /* timestamp_device_coherent = */ true);
+
    struct spirv_to_nir_options sopts = {
       .environment = NIR_SPIRV_VULKAN,
-      .capabilities = NULL,
+      .capabilities = &spirv_caps,
+      .group_non_uniform_subgroup_size = 16, // pan_subgroup_size(PAN_ARCH) is fixed to 16
       .ubo_addr_format = nir_address_format_vec2_index_32bit_offset,
       .ssbo_addr_format = nir_address_format_vec2_index_32bit_offset,
       .phys_ssbo_addr_format = nir_address_format_64bit_global,
