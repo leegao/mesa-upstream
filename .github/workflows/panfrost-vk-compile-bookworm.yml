@@ -178,12 +178,21 @@ jobs:
         done
         echo "sample shaders: $pass passed, $fail failed (of $((pass + fail)))"
 
+    - name: Stage artifacts
+      if: always()
+      run: |
+        mkdir -p stage
+        cp build/src/panfrost/clc/panfrost_vk_compile stage/
+        cp build/src/panfrost/clc/libpanfrost_vk_compile.a stage/
+        cp src/panfrost/clc/panfrost_vk_compile.h stage/
+        ls -l stage
+
     - name: Upload artifact
       if: always()
       uses: actions/upload-artifact@v4
       with:
         name: panfrost_vk_compile-bookworm-${{ matrix.variant }}
-        path: build/src/panfrost/clc/panfrost_vk_compile
+        path: stage/
         retention-days: 5
 
   # Publish a GitHub release on manual workflow runs only. The Linux epoch in
@@ -197,6 +206,9 @@ jobs:
     permissions:
       contents: write
     steps:
+    - name: Checkout (for comp_rep_minimal.spv)
+      uses: actions/checkout@v4
+
     - name: Download build artifacts
       uses: actions/download-artifact@v4
       with:
@@ -213,43 +225,63 @@ jobs:
         echo "date=$DATE" >> "$GITHUB_OUTPUT"
         echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
 
-    - name: Flatten variant binaries
+    - name: Flatten variant artifacts
       run: |
-        # download-artifact nests each matrix artifact in its own directory and
-        # both are named `panfrost_vk_compile`; copy them out under unique names.
         mkdir -p out
         for d in dist/*/; do
           variant="$(basename "$d")"
           variant="${variant#panfrost_vk_compile-bookworm-}"
-          cp "$d/panfrost_vk_compile" "out/panfrost_vk_compile-bookworm-${variant}"
+          cp "$d/panfrost_vk_compile"       "out/panfrost_vk_compile-bookworm-${variant}"
+          cp "$d/libpanfrost_vk_compile.a"  "out/libpanfrost_vk_compile-bookworm-${variant}.a"
+          cp "$d/panfrost_vk_compile.h"     "out/panfrost_vk_compile-bookworm-${variant}.h"
         done
+        # Separate static-library bundle (.a + .h for every variant).
+        mkdir -p static-libs
+        cp out/libpanfrost_vk_compile-bookworm-*.a static-libs/
+        cp out/panfrost_vk_compile-bookworm-*.h static-libs/
+        tar -cJf out/panfrost_vk_compile-static-libs-bookworm.tar.xz -C static-libs .
         ls -l out
+
+    - name: Capture help + disasm for release notes
+      run: |
+        BIN=out/panfrost_vk_compile-bookworm-kraid
+        test -x "$BIN" || BIN=out/panfrost_vk_compile-bookworm-stable
+        "$BIN" -h > help.txt 2>&1 || true
+        "$BIN" --kraid --disasm comp_rep_minimal.spv test.bin > disasm.txt 2>&1 || true
+        {
+          echo
+          echo "### \`panfrost_vk_compile -h\`"
+          echo '```'
+          cat help.txt
+          echo '```'
+          echo
+          echo "### \`panfrost_vk_compile --kraid --disasm comp_rep_minimal.spv test.bin\`"
+          echo '```'
+          cat disasm.txt
+          echo '```'
+        } > notes-snippet.md
+        echo "---- help.txt ----"; cat help.txt
+        echo "---- disasm.txt (head) ----"; head -40 disasm.txt
+
+    - name: Build release body
+      run: |
+        cat > body.md <<EOF
+        Automated panfrost_vk_compile build (Debian bookworm) for ${{ steps.rel.outputs.commit }}.
+
+        Binaries: \`panfrost_vk_compile-bookworm-{stable,kraid}\`
+        Static libs: \`panfrost_vk_compile-static-libs-bookworm.tar.xz\` (\`.a\` + \`.h\` per variant)
+        EOF
+        cat notes-snippet.md >> body.md
 
     - name: Create GitHub release
       uses: softprops/action-gh-release@v2
       with:
         tag_name: ${{ steps.rel.outputs.tag }}
         name: Bookworm panfrost_vk_compile ${{ steps.rel.outputs.date }} (${{ steps.rel.outputs.commit }})
-        body: |
-          Automated panfrost_vk_compile build (Debian bookworm) for ${{ steps.rel.outputs.commit }}.
-          Usage: panfrost_vk_compile [options] <input.spv> <output.bin>
-            (built for Valhall arch v11)
-
-          Options:
-            --kraid               Force Rust Kraid backend (PAN_USE_KRAID=all)
-            --no-kraid            Force C Bifrost/Valhall backend (PAN_USE_KRAID=0)
-            --robust              Enable SSBO/descriptor robustness bounds checks
-            --no-idvs             Disable IDVS for vertex shaders
-            --entry <name>        Override SPIR-V entry point name
-            --stage <vert|frag|comp>  Override detected shader stage
-            --core-max-id <N>     Set load_core_max_id_arm sysval (default: 0)
-            --no-promote-imm      Disable FAU immediate promotion
-            --no-clamp-version    Do not clamp SPIR-V >= 1.4 header to 1.3
-            --dump-nir            Print final lowered NIR to stderr
-            --disasm              Disassemble emitted Valhall ISA to stderr
-            --info-json <file>    Write FAU, descriptor, and shader stats JSON
-            -h, --help            Show this help message
-        files: out/panfrost_vk_compile-bookworm-*
+        body_path: body.md
+        files: |
+          out/panfrost_vk_compile-bookworm-*
+          out/panfrost_vk_compile-static-libs-bookworm.tar.xz
         fail_on_unmatched_files: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

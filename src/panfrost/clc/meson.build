@@ -53,6 +53,11 @@ libpanfrost_vk_compile = static_library(
     c_msvc_compat_args, no_override_init_args, soong_compat_c_args,
   ],
   dependencies : [idep_vtn, idep_nir, idep_mesautil, libpanfrost_dep],
+  # Meson builds thin archives by default (they only reference the build-dir
+  # .o files by path), which makes the shipped .a useless outside the build
+  # tree.  Marking the library as installable forces a regular, self-contained
+  # archive so it can be reused from the release tarball.
+  install : true,
 )
 
 panfrost_vk_compile = executable(

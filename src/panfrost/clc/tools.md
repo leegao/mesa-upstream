@@ -34,7 +34,7 @@ meson setup build . \
 ninja -C build src/panfrost/clc/panfrost_vk_compile
 ```
 
-To target a different Valhall architecture, change `pan_vk_arch` in `src/panfrost/clc/meson.build` (valid `9..15`).
+The target Valhall architecture is now a **runtime** flag (`--arch <N|vN>`, valid `9..15`, default `11`); there is no compile-time `PAN_ARCH` specialization anymore. The static library always contains all arch-gated code paths and selects them per call.
 
 ---
 
@@ -46,6 +46,7 @@ panfrost_vk_compile [options] <input.spv> <output.bin>
 
 | Option | Default | Description |
 | :--- | :--- | :--- |
+| `--arch <N\|vN>` | `11` | Target Valhall generation (`9..15`). Accepts `11` or `v11`. Selects caps, `pan_subgroup_size`, `robust_descriptors`, cooperative-matrix support, etc. at runtime. |
 | `--kraid` | env / Mesa default | Sets `PAN_USE_KRAID=all` to compile via the Rust Kraid backend (effective when built with `-Dpanfrost-rust=true`). |
 | `--no-kraid` | — | Sets `PAN_USE_KRAID=0` to force the C Bifrost/Valhall backend. |
 | `--robust` | off (or `PANVK_ROBUST=1`) | Enables `nir_lower_robust_access` (`get_ssbo_size` bounds checks) and descriptor array bounds clamping. Off by default to match `libMali` (`cmpbe_has_robustness == 0`). |
@@ -56,9 +57,55 @@ panfrost_vk_compile [options] <input.spv> <output.bin>
 | `--no-promote-imm` | off (`promote_immediates = true`) | Disables backend immediate promotion into FAU. |
 | `--no-clamp-version` | off (clamps `>= 1.4` to `1.3`) | Keeps the original SPIR-V version word instead of clamping `>= 1.4` to `1.3` for unlisted globals. |
 | `--dump-nir` | off | Prints the final lowered NIR shader to `stderr` immediately before `pan_shader_compile()`. |
-| `--disasm` | off | Sets `BIFROST_MESA_DEBUG=shaders` and `PAN_MESA_DEBUG=shaders` to print Valhall disassembly to `stderr`. |
+| `--disasm` | off | Disassembles the emitted Valhall/Bifrost ISA to `stderr` via `pan_disassemble_bi()` (works for both the Kraid and C backends). |
 | `--info-json <file>` | off | Writes a JSON report with stage, backend, register/TLS/WLS counts, FAU word allocations (`sysval_slots`, `immediates`, `ubo_relocs`), and synthetic descriptor table mappings. |
 | `-h`, `--help` | — | Prints usage and exits `0`. |
+
+### Static library
+
+The build also produces a reusable static library and public header (no `main`):
+
+- `build/src/panfrost/clc/libpanfrost_vk_compile.a`
+- `src/panfrost/clc/panfrost_vk_compile.h`
+
+The library is marked `install : true` in `src/panfrost/clc/meson.build`, so `meson install` (or `ninja -C build install`) installs it alongside the header. This also forces meson to emit a **regular** archive rather than a thin one — a thin archive only references build-dir `.o` files by path and is unusable once shipped, whereas the installed `.a` is self-contained (it bundles the NIR, SPIR-V front-end, and panfrost objects it depends on).
+
+Link against it and call `panfrost_vk_compile(const struct panfrost_vk_compile_options *opts)` (returns `0` on success). The backend is chosen by the process-global `PAN_USE_KRAID` env var (read via `pan_use_kraid()`); set it before the first call to override. See `panfrost_vk_compile.h` for the full options struct.
+
+Minimal `main.c` (mirrors what the CLI does — zero-initialize the options, set the required paths, call once):
+
+```c
+#include "panfrost_vk_compile.h"
+#include <stdio.h>
+
+int
+main(int argc, char **argv)
+{
+   if (argc != 3) {
+      fprintf(stderr, "usage: %s <input.spv> <output.bin>\n", argv[0]);
+      return 1;
+   }
+
+   struct panfrost_vk_compile_options opts = {
+      .in_path = argv[1],
+      .out_path = argv[2],
+      .arch = 11,            /* Valhall generation 9..15 */
+      .stage_override = -1,  /* detect from OpEntryPoint */
+      .promote_imm = true,
+      .clamp_version = true,
+   };
+
+   return panfrost_vk_compile(&opts);
+}
+```
+
+Build and link (the archive is self-contained, so you only need it plus `libpanfrost_compiler` and the usual system libs — no separate `-lnir` / `-lmesautil`):
+
+```sh
+cc main.c -I src/panfrost/clc -I src -I include \
+   build/src/panfrost/clc/libpanfrost_vk_compile.a \
+   -lpanfrost_compiler -lm -o main
+```
 
 ---
 
