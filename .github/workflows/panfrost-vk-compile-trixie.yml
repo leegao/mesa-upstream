@@ -70,7 +70,12 @@ jobs:
       if: matrix.panfrost_rust
       run: |
         # Mesa requires bindgen >= 0.71.1; 0.72.0 and 0.73.x are blacklisted.
+        # Native cargo installs to $CARGO_HOME/bin (default ~/.cargo/bin), which
+        # is not on PATH in the container, so add it for this and later steps.
+        CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
         cargo install bindgen-cli --version 0.71.1 --locked
+        export PATH="$CARGO_BIN:$PATH"
+        echo "$CARGO_BIN" >> "$GITHUB_PATH"
         bindgen --version
 
     - name: Configure
