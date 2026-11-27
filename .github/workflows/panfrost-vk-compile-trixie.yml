@@ -61,7 +61,7 @@ jobs:
           python3 python3-pip python3-venv \
           spirv-tools spirv-headers glslang-tools \
           llvm-19-dev libclang-19-dev libclc-19-dev libllvmspirvlib-19-dev \
-          rustc cargo
+          rustc cargo xz-utils
         # Newer meson/ninja than trixie's distro packages (usually fine, but
         # pin to be safe and to get mako).
         pip install --break-system-packages meson ninja mako
@@ -133,6 +133,14 @@ jobs:
         glslangValidator -S vert -V vert.vert -o vert.spv
         "$BIN" --kraid vert.spv vert_kraid.bin
         test -s vert_kraid.bin
+
+        # Run the compiler over a random sample of 100 real SPIR-V shaders
+        # (predownloaded/sample_shaders.tar.xz, sampled from spirv.tar.xz).
+        tar -xf predownloaded/sample_shaders.tar.xz -C /tmp
+        for spv in /tmp/spirv_samples/*.spv; do
+          "$BIN" "$spv" /tmp/sample_out.bin || exit 1
+          test -s /tmp/sample_out.bin
+        done
 
     - name: Upload artifact
       if: always()
