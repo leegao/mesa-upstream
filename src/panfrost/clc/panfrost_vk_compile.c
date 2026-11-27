@@ -1359,11 +1359,6 @@ main(int argc, char **argv)
       return 1;
    }
 
-   if (disasm) {
-      setenv("BIFROST_MESA_DEBUG", "shaders", 1);
-      setenv("PAN_MESA_DEBUG", "shaders", 1);
-   }
-
    size_t spirv_size = 0;
    uint32_t *words = read_spirv(in_path, &spirv_size);
    if (!words)
@@ -1585,6 +1580,12 @@ main(int argc, char **argv)
    struct util_dynarray binary;
    util_dynarray_init(&binary, NULL);
    pan_shader_compile(nir, &inputs, &binary, &info);
+
+   if (disasm) {
+      pan_disassemble_bi(stderr, binary.data, binary.size, PAN_ARCH,
+                           /* verbose = */ true);
+      fprintf(stderr, "\n");
+   }
 
    FILE *out = fopen(out_path, "wb");
    if (!out) {
