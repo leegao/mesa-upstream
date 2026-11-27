@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -149,3 +149,32 @@ jobs:
         name: panfrost_vk_compile-bookworm
         path: build/src/panfrost/clc/panfrost_vk_compile
         retention-days: 5
+
+    # Publish a GitHub release on manual workflow runs only. The Linux epoch in
+    # the tag guarantees uniqueness, so re-runs never collide.
+    - name: Prepare release metadata
+      if: github.event_name == 'workflow_dispatch'
+      id: rel
+      run: |
+        DATE="$(date -u +%Y%m%d)"
+        COMMIT="$(git rev-parse --short HEAD)"
+        EPOCH="$(date -u +%s)"
+        TAG="panfrost-vk-compile-bookworm-${DATE}-${COMMIT}-${EPOCH}"
+        ASSET="panfrost_vk_compile-bookworm-${TAG}"
+        cp build/src/panfrost/clc/panfrost_vk_compile "$ASSET"
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+        echo "date=$DATE" >> "$GITHUB_OUTPUT"
+        echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+
+    - name: Create GitHub release
+      if: github.event_name == 'workflow_dispatch'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.rel.outputs.tag }}
+        name: Bookworm bundle ${{ steps.rel.outputs.date }} (${{ steps.rel.outputs.commit }})
+        body: Automated panfrost_vk_compile build (Debian bookworm, rust/kraid) for ${{ steps.rel.outputs.commit }}.
+        files: ${{ steps.rel.outputs.asset }}
+        fail_on_unmatched_files: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

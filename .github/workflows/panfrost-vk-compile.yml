@@ -133,3 +133,53 @@ jobs:
         name: panfrost_vk_compile-${{ matrix.variant }}
         path: build-panfrost-vk/src/panfrost/clc/panfrost_vk_compile
         retention-days: 5
+
+  # Publish a GitHub release on manual workflow runs only. The Linux epoch in
+  # the tag guarantees uniqueness, so re-runs never collide. Both matrix
+  # variants are attached with distinct asset names.
+  release:
+    name: Publish release
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist
+
+    - name: Prepare release metadata
+      id: rel
+      run: |
+        DATE="$(date -u +%Y%m%d)"
+        COMMIT="$(echo "${GITHUB_SHA}" | cut -c1-7)"
+        EPOCH="$(date -u +%s)"
+        TAG="panfrost-vk-compile-${DATE}-${COMMIT}-${EPOCH}"
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        echo "date=$DATE" >> "$GITHUB_OUTPUT"
+        echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+
+    - name: Flatten variant binaries
+      run: |
+        # download-artifact nests each matrix artifact in its own directory and
+        # both are named `panfrost_vk_compile`; copy them out under unique names.
+        mkdir -p out
+        for d in dist/*/; do
+          variant="$(basename "$d")"
+          variant="${variant#panfrost_vk_compile-}"
+          cp "$d/panfrost_vk_compile" "out/panfrost_vk_compile-${variant}"
+        done
+        ls -l out
+
+    - name: Create GitHub release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.rel.outputs.tag }}
+        name: Panfrost VK compile ${{ steps.rel.outputs.date }} (${{ steps.rel.outputs.commit }})
+        body: Automated panfrost_vk_compile build for ${{ steps.rel.outputs.commit }}.
+        files: out/panfrost_vk_compile-*
+        fail_on_unmatched_files: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

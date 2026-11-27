@@ -13,7 +13,7 @@ on:
       - '.github/workflows/panfrost-vk-predownloaded.yml'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   package:
@@ -50,3 +50,29 @@ jobs:
         name: predownloaded-bookworm
         path: predownloaded-bookworm.tar.xz
         retention-days: 5
+
+    # Publish a GitHub release on every push to this branch. The Linux epoch in
+    # the tag guarantees uniqueness, so re-runs never collide.
+    - name: Prepare release metadata
+      if: github.event_name == 'push' && github.ref == 'refs/heads/panfrost-compiler'
+      id: rel
+      run: |
+        DATE="$(date -u +%Y%m%d)"
+        COMMIT="$(git rev-parse --short HEAD)"
+        EPOCH="$(date -u +%s)"
+        TAG="bookworm-bundle-${DATE}-${COMMIT}-${EPOCH}"
+        echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+        echo "date=$DATE" >> "$GITHUB_OUTPUT"
+        echo "commit=$COMMIT" >> "$GITHUB_OUTPUT"
+
+    - name: Create GitHub release
+      if: github.event_name == 'push' && github.ref == 'refs/heads/panfrost-compiler'
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.rel.outputs.tag }}
+        name: Bookworm bundle ${{ steps.rel.outputs.date }} (${{ steps.rel.outputs.commit }})
+        body: Automated predownloaded bookworm bundle for ${{ steps.rel.outputs.commit }}.
+        files: predownloaded-bookworm.tar.xz
+        fail_on_unmatched_files: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
