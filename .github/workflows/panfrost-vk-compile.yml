@@ -12,16 +12,16 @@ name: Panfrost Vulkan SPIR-V Compiler
 #                  run with PAN_USE_KRAID=all to exercise the Kraid path.
 
 on:
-  push:
-    paths:
-      - 'src/panfrost/**'
-      - 'src/compiler/**'
-      - '.github/workflows/panfrost-vk-compile.yml'
-  pull_request:
-    paths:
-      - 'src/panfrost/**'
-      - 'src/compiler/**'
-      - '.github/workflows/panfrost-vk-compile.yml'
+  # push:
+  #   paths:
+  #     - 'src/panfrost/**'
+  #     - 'src/compiler/**'
+  #     - '.github/workflows/panfrost-vk-compile.yml'
+  # pull_request:
+  #   paths:
+  #     - 'src/panfrost/**'
+  #     - 'src/compiler/**'
+  #     - '.github/workflows/panfrost-vk-compile.yml'
   workflow_dispatch:
 
 permissions:

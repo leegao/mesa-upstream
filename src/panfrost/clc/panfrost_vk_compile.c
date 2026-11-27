@@ -1436,6 +1436,12 @@ main(int argc, char **argv)
                nir_var_shader_in | nir_var_shader_out, UINT32_MAX);
       NIR_PASS(_, nir, nir_lower_io_vars_to_temporaries,
                nir_shader_get_entrypoint(nir), nir_var_shader_out);
+      NIR_PASS(_, nir, nir_lower_global_vars_to_local);
+      // nir_lower_global_vars_to_local generates meta-instructions that need to be elided
+      // these have already run before, but we need to run them here too
+      NIR_PASS(_, nir, nir_split_var_copies);
+      NIR_PASS(_, nir, nir_lower_var_copies);
+      NIR_PASS(_, nir, nir_lower_vars_to_ssa);
       NIR_PASS(_, nir, nir_lower_io,
                nir_var_shader_in | nir_var_shader_out, glsl_type_size,
                stage == MESA_SHADER_FRAGMENT
